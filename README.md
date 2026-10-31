@@ -144,27 +144,73 @@ goes to a human.
 
 ## Measuring the LLM against the rules
 
-`llm_eval.py` takes about 100 labelled faults from the held-out days, gives
-the LLM exactly the prompt the pipeline uses, and gives the rules the same
-numbers. It reports accuracy (overall, severe, subtle, per fault type), how
-often replies are valid, whether the LLM's confidence means anything, how
-often LLM and rules disagree and who is right, latency, and above all how
-many automatic fixes would be applied for the wrong fault.
+`llm_eval.py` takes labelled faults, gives the LLM exactly the classifier
+prompt the pipeline uses, and gives the rule-based classifier the same
+numbers. It reports accuracy (overall, severe, subtle, per fault type),
+valid replies versus errors, whether the LLM's confidence means anything,
+who is right when they disagree, latency, and how many automatic fixes would
+be applied for the wrong fault.
+
+### First result: the LLM made things worse
+
+Qwen2.5 7B through Ollama on a Kaggle T4, original prompt, 86 held-out faults:
+
+| | LLM | Rules | Pipeline (LLM first) |
+|---|---|---|---|
+| All faults | 58% | 62% | 57% |
+| Severe (50) | 66% | 86% | 66% |
+| Subtle (36) | 46% | 28% | 44% |
+
+- The LLM said HIGH confidence on 81 of 85 valid replies and was right 56%
+  of the time, so its confidence is not a usable safety signal.
+- The pipeline would have applied 30 automatic fixes, 13 for the wrong
+  fault. The rules cross-check cut this from 22, but it can't catch
+  mistakes both make: subtle capacity overloads and coverage gaps look like
+  handover storms to both.
+- The LLM is better than the rules on subtle faults, where the rules often
+  give up and answer "unclassified".
+
+This comparison favours the rules: they were written by someone who knew
+how the simulator creates each fault, while the LLM only got a one-line
+description of each mode.
+
+### Giving the LLM a fair chance
+
+The next round tests whether a better setup changes the picture:
+
+- **Prompts** (`--prompt`): `basic` (the prompt above), `signatures` (adds
+  what each fault does to the KPIs, the same knowledge the rules use),
+  `fewshot` (signatures plus 10 solved examples from days 1 to 7)
+- **Models:** Qwen2.5 7B and 14B
+- **Decision policies:** `llm_first` (the LLM decides, rules as fallback) and
+  `rules_first` (the rules decide, the LLM only when they say
+  "unclassified"); the LLM's confidence is kept only when it agrees with
+  the rules
+- **Auto-apply:** the current three conditions, and the same plus "the
+  reading must be CRITICAL"
+
+The held-out run above was used to decide to run these experiments, so the
+choice between them is made on **validation days 8 to 10** (54 faults). The
+held-out days are run once more at the end with the chosen setup. With 54
+faults, differences under about 10 points are noise.
+
+**How the winner is chosen, decided before seeing the results:** first, the
+fewest automatic fixes for the wrong fault; then the highest pipeline
+accuracy; then the simplest setup (rules over LLM, smaller model, shorter
+prompt).
+
+Results: to be added after the validation runs.
 
 ```bash
-# Anthropic API (no local GPU needed)
-NETSENTINEL_LLM=anthropic ANTHROPIC_API_KEY=sk-ant-... python llm_eval.py --n 100
-
-# or a local / remote Ollama model
-NETSENTINEL_LLM=ollama OLLAMA_MODEL=gpt-oss:20b python llm_eval.py --n 100
+python llm_eval.py --prompt signatures                     # validation days (default)
+python -m experiments.compare_llm_reports --split validation
+python llm_eval.py --split heldout --prompt <chosen>       # once, at the end
 ```
 
-Results go to `reports/`. Baseline without any LLM, on 86 held-out faults:
-the rules name the right fault 62% of the time (86% of severe faults, 28%
-of subtle ones).
-
-The real LLM numbers are not in this README yet; they get added once the
-evaluation has been run.
+The pipeline's settings are environment variables, and the defaults are the
+original behaviour until a variant wins on validation:
+`NETSENTINEL_PROMPT` (basic | signatures | fewshot), `NETSENTINEL_POLICY`
+(llm_first | rules_first), `NETSENTINEL_AUTO_CRITICAL` (0 | 1).
 
 ## Setup
 
@@ -290,7 +336,8 @@ features.py          per-cell time-of-day baseline and deviation features
 evaluation.py        alarms, event-level metrics, baseline detectors
 model_trainer.py     training, scoring, held-out comparison
 llm.py               LLM backends (Ollama, Anthropic API, none)
-llm_eval.py          LLM vs rules evaluation on held-out faults
+llm_eval.py          LLM vs rules evaluation (validation or held-out faults)
+prompts.py           classifier prompt variants
 cpp/                 C++17 baseline, pybind11 bindings, GoogleTest
 ci/                  shared CI script and the Jenkins agent image
 Jenkinsfile          Jenkins pipeline
@@ -314,7 +361,7 @@ tests/               pytest suite
 
 ## Roadmap
 
-- Run `llm_eval.py` with a real model and publish the numbers
+- Finish the fair-chance LLM experiments and set the pipeline defaults from them
 
 ## References
 

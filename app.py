@@ -20,9 +20,12 @@ from plotly.subplots import make_subplots
 from config import (
     ANOMALY_SCORE_CRITICAL,
     ANOMALY_SCORE_WARNING,
+    AUTO_APPLY_REQUIRES_CRITICAL,
+    DECISION_POLICY,
     KPIS,
     METRICS_PATH,
     MODEL_PATH,
+    PROMPT_VARIANT,
 )
 from data_generator import generate_dataset
 from evaluation import alarms_from_flags
@@ -144,6 +147,8 @@ with st.sidebar:
 
     st.markdown("### Agent")
     st.code(describe_backend(), language=None)
+    st.caption(f"Prompt: {PROMPT_VARIANT} · policy: {DECISION_POLICY} · "
+               f"auto-apply needs CRITICAL: {'yes' if AUTO_APPLY_REQUIRES_CRITICAL else 'no'}")
     run_btn = st.button("▶ Run agent on current reading", type="primary", width="stretch")
 
     st.markdown("### Model results (held-out days)")

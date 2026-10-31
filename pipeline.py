@@ -37,7 +37,15 @@ import numpy as np
 from langgraph.graph import END, START, StateGraph
 
 import llm
-from config import ANOMALY_SCENARIOS, KPIS, ZSCORE_FLAG
+import prompts
+from config import (
+    ANOMALY_SCENARIOS,
+    AUTO_APPLY_REQUIRES_CRITICAL,
+    DECISION_POLICY,
+    KPIS,
+    PROMPT_VARIANT,
+    ZSCORE_FLAG,
+)
 from features import RESIDUAL_COLUMNS, build_features
 from knowledge_base import format_for_llm, retrieve_procedure
 from model_trainer import load_model_and_scaler, score_cell_window, severity_from_score
@@ -207,40 +215,51 @@ def validate_diagnosis(diagnosis: Optional[dict]) -> Optional[tuple[str, str, st
     return mode, conf, str(diagnosis.get("summary", ""))[:500]
 
 
-CLASSIFIER_SYSTEM = "You are a 5G RAN engineer. Return only JSON."
+CLASSIFIER_SYSTEM = prompts.SYSTEM
+POLICIES = ("llm_first", "rules_first")
 
 
-def classifier_prompt(cell_id: str, score: float, snapshot: dict, z: dict, flagged: list[str]) -> str:
-    kpi_context = "\n".join(
-        f"  {k}: {snapshot[k]:.3f} (z={z[k]:.2f})" + (" <- FLAGGED" if k in flagged else "")
-        for k in KPIS
-    )
-    modes = "\n".join(f"  {k}: {v}" for k, v in ANOMALY_SCENARIOS.items())
-    return (
-        "Classify the failure mode of this 5G cell from its KPI readings.\n"
-        "z is how far each KPI is from this cell's normal value at this time of day, "
-        "in robust standard deviations (negative = lower than normal).\n\n"
-        f"Cell: {cell_id} | Anomaly score: {score:.4f} | "
-        f"Flagged KPIs: {', '.join(flagged) or 'none'}\n\n"
-        f"KPI READINGS:\n{kpi_context}\n\nPOSSIBLE FAILURE MODES:\n{modes}\n\n"
-        "Respond with JSON only:\n"
-        '{"failure_mode": "<one of the keys above>", "confidence": "<HIGH|MEDIUM|LOW>", '
-        '"summary": "<2 sentence technical explanation>"}'
-    )
+def classifier_prompt(cell_id: str, score: float, snapshot: dict, z: dict, flagged: list[str],
+                      variant: Optional[str] = None, examples: Optional[list[dict]] = None) -> str:
+    return prompts.build_classifier_prompt(cell_id, score, snapshot, z, flagged,
+                                           variant or PROMPT_VARIANT, examples)
 
 
 def diagnose(prompt: str) -> tuple[Optional[tuple[str, str, str]], Optional[str]]:
-    """Ask the LLM. Returns (validated diagnosis or None, raw reply)."""
+    """Ask the LLM. Returns (validated diagnosis or None, raw reply or None if the LLM was unreachable)."""
     raw = call_llm(prompt, system=CLASSIFIER_SYSTEM)
     return validate_diagnosis(parse_json(raw)), raw
 
 
-def decide(llm_result: Optional[tuple[str, str, str]], z: dict) -> tuple[str, str, str, str]:
-    """Final (mode, confidence, summary, source): the LLM if valid, else the rules at LOW confidence."""
+def decide(llm_result: Optional[tuple[str, str, str]], z: dict,
+           policy: Optional[str] = None) -> tuple[str, str, str, str]:
+    """
+    Final (mode, confidence, summary, source).
+
+    llm_first    the LLM if its reply is valid, otherwise the rules at LOW confidence
+    rules_first  the rules, unless they say "unclassified"; then the LLM. The LLM's
+                 confidence is only kept when it names the same mode as the rules.
+    """
+    policy = policy or DECISION_POLICY
+    if policy not in POLICIES:
+        raise ValueError(f"unknown decision policy {policy!r}; choose from {POLICIES}")
+    rules_mode = rule_based_classify(z)
+
+    if policy == "llm_first":
+        if llm_result:
+            mode, confidence, summary = llm_result
+            return mode, confidence, summary, "llm"
+        return rules_mode, "LOW", "", "rules"
+
+    # rules_first
+    if rules_mode != UNCLASSIFIED:
+        if llm_result and llm_result[0] == rules_mode:
+            return rules_mode, llm_result[1], llm_result[2], "rules+llm"
+        return rules_mode, "LOW", llm_result[2] if llm_result else "", "rules"
     if llm_result:
         mode, confidence, summary = llm_result
         return mode, confidence, summary, "llm"
-    return rule_based_classify(z), "LOW", "", "rules"
+    return UNCLASSIFIED, "LOW", "", "rules"
 
 
 def root_cause_classifier_node(state: AgentState) -> AgentState:
@@ -250,8 +269,10 @@ def root_cause_classifier_node(state: AgentState) -> AgentState:
     log.append("[Root Cause Classifier] Asking LLM for failure mode ...")
     llm_result, _ = diagnose(prompt)
     mode, confidence, summary, source = decide(llm_result, state["kpi_zscores"])
-    if source == "rules":
-        log.append("[Root Cause Classifier] LLM unavailable or output invalid, using rule-based fallback")
+    if llm_result is None:
+        log.append("[Root Cause Classifier] LLM unavailable or output invalid")
+    if source.startswith("rules"):
+        log.append(f"[Root Cause Classifier] Decided by the rules (policy: {DECISION_POLICY})")
     log.append(f"[Root Cause Classifier] Mode: {mode} | Confidence: {confidence} | Source: {source}")
 
     proc = retrieve_procedure(mode)
@@ -266,7 +287,7 @@ def root_cause_classifier_node(state: AgentState) -> AgentState:
     log.append(f"[Root Cause Classifier] Procedure: {procedure['id']}")
 
     rules_mode = rule_based_classify(state["kpi_zscores"])
-    if source == "llm" and rules_mode != mode:
+    if rules_mode != mode:
         log.append(f"[Root Cause Classifier] Rules disagree ({rules_mode}), so no automatic action")
 
     return {**state, "failure_mode": mode, "failure_confidence": confidence,
@@ -274,10 +295,17 @@ def root_cause_classifier_node(state: AgentState) -> AgentState:
             "root_cause_summary": summary, "procedure": procedure, "reasoning_log": log}
 
 
-def would_auto_apply(mode: str, confidence: str, rules_mode: str) -> bool:
-    """HIGH confidence + auto-applicable procedure + independent agreement from the rules."""
+def would_auto_apply(mode: str, confidence: str, rules_mode: str, severity: str = "CRITICAL",
+                     require_critical: Optional[bool] = None) -> bool:
+    """
+    HIGH confidence + auto-applicable procedure + independent agreement from the rules,
+    and, if required (NETSENTINEL_AUTO_CRITICAL=1), a CRITICAL reading.
+    """
+    if require_critical is None:
+        require_critical = AUTO_APPLY_REQUIRES_CRITICAL
     proc = retrieve_procedure(mode)
-    return confidence == "HIGH" and bool(proc and proc.auto_applicable) and rules_mode == mode
+    ok = confidence == "HIGH" and bool(proc and proc.auto_applicable) and rules_mode == mode
+    return ok and (severity == "CRITICAL" or not require_critical)
 
 
 # ── Node 3b: Routine monitor ──────────────────────────────────────────────
@@ -310,7 +338,8 @@ def routine_monitor_node(state: AgentState) -> AgentState:
 def build_action_plan(state: AgentState) -> dict:
     """All decision fields come from code, never from the LLM."""
     proc = state["procedure"]
-    apply_now = would_auto_apply(state["failure_mode"], state["failure_confidence"], state["rules_mode"])
+    apply_now = would_auto_apply(state["failure_mode"], state["failure_confidence"], state["rules_mode"],
+                                 state["severity"])
     return {
         "plan_id": f"ACT-{state['cell_id']}-{uuid.uuid4().hex[:8]}",
         "cell_id": state["cell_id"],

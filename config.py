@@ -15,6 +15,12 @@ OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
 LLM_TIMEOUT_S   = float(os.getenv("NETSENTINEL_LLM_TIMEOUT", "60"))
 
+# How the LLM is used. Defaults are the original behaviour; they only change
+# after a variant has won on the validation days (llm_eval.py --split validation).
+PROMPT_VARIANT  = os.getenv("NETSENTINEL_PROMPT", "basic")        # basic | signatures | fewshot
+DECISION_POLICY = os.getenv("NETSENTINEL_POLICY", "llm_first")    # llm_first | rules_first
+AUTO_APPLY_REQUIRES_CRITICAL = os.getenv("NETSENTINEL_AUTO_CRITICAL", "0") == "1"
+
 # ── Paths ─────────────────────────────────────────────────────────────────
 DATA_DIR     = "data"
 DATA_FILE    = "data/ran_kpi_dataset.csv"

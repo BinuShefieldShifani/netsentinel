@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from config import ANOMALY_SCENARIOS
+from pipeline import decide as pipeline_decide
 from pipeline import flag_kpis, parse_json, robust_zscores, rule_based_classify, validate_diagnosis
 from tests.conftest import mid_event_rows, quiet_rows, window_ending_at
 
@@ -179,3 +180,40 @@ def test_garbage_llm_output_falls_back_to_rules(dataset, fake_llm):
     out = p.run_analysis(*_first(dataset, "interference"))
     assert out["classification_source"] == "rules"
     assert out["action_plan"]["technical_rationale"]   # code-written default is kept
+
+
+# ── Decision policies ─────────────────────────────────────────────────────
+
+Z_HANDOVER = {"rsrp": 0, "rsrq": 0, "sinr": 0, "prb_dl": 0, "prb_ul": 0, "cqi": 0,
+              "ho_sr": -8, "rlf_rate": 5, "tp_dl": 0, "tp_ul": 0}
+Z_CALM = {k: 0.0 for k in Z_HANDOVER}
+
+
+def test_llm_first_policy_trusts_a_valid_llm():
+    assert pipeline_decide(("interference", "HIGH", "s"), Z_HANDOVER, "llm_first")[:2] == ("interference", "HIGH")
+
+
+def test_rules_first_policy_keeps_rules_and_drops_llm_confidence_when_they_disagree():
+    assert pipeline_decide(("interference", "HIGH", "s"), Z_HANDOVER, "rules_first")[:2] == ("handover_storm", "LOW")
+
+
+def test_rules_first_policy_keeps_llm_confidence_when_they_agree():
+    out = pipeline_decide(("handover_storm", "HIGH", "s"), Z_HANDOVER, "rules_first")
+    assert out[:2] == ("handover_storm", "HIGH") and out[3] == "rules+llm"
+
+
+def test_rules_first_policy_asks_llm_only_when_rules_abstain():
+    assert pipeline_decide(("coverage_gap", "MEDIUM", "s"), Z_CALM, "rules_first")[:2] == ("coverage_gap", "MEDIUM")
+    assert pipeline_decide(None, Z_CALM, "rules_first")[0] == "unclassified"
+
+
+def test_unknown_policy_is_rejected():
+    with pytest.raises(ValueError):
+        pipeline_decide(None, Z_CALM, "vote")
+
+
+def test_critical_requirement_blocks_auto_apply_on_warnings():
+    from pipeline import would_auto_apply
+    assert would_auto_apply("handover_storm", "HIGH", "handover_storm", "WARNING", require_critical=False)
+    assert not would_auto_apply("handover_storm", "HIGH", "handover_storm", "WARNING", require_critical=True)
+    assert would_auto_apply("handover_storm", "HIGH", "handover_storm", "CRITICAL", require_critical=True)

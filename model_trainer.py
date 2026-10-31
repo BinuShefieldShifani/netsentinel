@@ -1,20 +1,22 @@
 """
-model_trainer.py - Isolation Forest anomaly detector
-====================================================
+model_trainer.py - Train and evaluate the anomaly detector
+==========================================================
 Run:  python model_trainer.py
 
-Generates the dataset (if missing), trains on the first TRAIN_SPLIT_DAYS of
-data and evaluates on the remaining days, so the reported numbers come from
-readings the model never saw. Metrics are written to models/metrics.json.
+Trains on the first TRAIN_SPLIT_DAYS days and evaluates on the rest, so all
+reported numbers come from days the model never saw. Writes the model, the
+scaler and models/metrics.json, which compares the model with two simpler
+detectors (see evaluation.py).
 
-Why Isolation Forest?
-  - Unsupervised: live networks rarely have clean anomaly labels
-  - Fast to train and score
-  - Gives a continuous anomaly score, not just 0/1
+Model: Isolation Forest on features.py output: the raw KPIs plus how far each
+KPI is from its own cell's normal value at that time of day. It is
+unsupervised: the labels are only used for evaluation. The feature set was
+chosen on validation days 8-10 (experiments/select_features.py), before the
+held-out days were looked at.
 
 Scoring convention used everywhere in this repo:
   decision_function() > 0  -> looks normal
-  decision_function() < 0  -> predicted anomaly
+  decision_function() < 0  -> flagged
 """
 
 import json
@@ -25,26 +27,24 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
-from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.preprocessing import StandardScaler
 
 from config import (
     ANOMALY_SCORE_CRITICAL,
     ANOMALY_SCORE_WARNING,
-    F1_TARGET,
     IF_CONTAMINATION,
     IF_MAX_FEATURES,
     IF_MAX_SAMPLES,
     IF_N_ESTIMATORS,
     METRICS_PATH,
     MODEL_PATH,
-    PRECISION_TARGET,
     RANDOM_SEED,
-    RECALL_TARGET,
     SCALER_PATH,
     TRAIN_SPLIT_DAYS,
 )
 from data_generator import KPI_FEATURES, generate_dataset
+from evaluation import evaluate_flags, fit_static_thresholds, format_table, static_threshold_flags
+from features import FEATURE_COLUMNS, build_features
 
 # ── Core functions (imported by the pipeline, the app and the tests) ──────
 
@@ -62,20 +62,19 @@ def fit_model(X: np.ndarray) -> tuple[IsolationForest, StandardScaler]:
     return model, scaler
 
 
-def score_readings(df: pd.DataFrame, model, scaler) -> np.ndarray:
-    """decision_function score per reading. Negative = predicted anomaly."""
-    return model.decision_function(scaler.transform(df[KPI_FEATURES].values))
+def score_readings(df: pd.DataFrame, model, scaler, features: pd.DataFrame | None = None) -> np.ndarray:
+    """
+    decision_function score for every row of df (same order). Negative = flagged.
+    df needs each cell's history, because features compare against earlier days.
+    """
+    feats = build_features(df) if features is None else features
+    return model.decision_function(scaler.transform(feats[FEATURE_COLUMNS].to_numpy()))
 
 
 def score_cell_window(cell_df: pd.DataFrame, model, scaler) -> tuple[float, bool]:
-    """
-    Score the LATEST reading of a cell.
-    (The earlier version averaged score_samples() over the whole history,
-    which used a different scale from the thresholds and marked every cell
-    CRITICAL.)
-    """
-    latest = cell_df.tail(1)
-    score = float(score_readings(latest, model, scaler)[0])
+    """Score the latest reading of one cell, using the rest of cell_df as history."""
+    ordered = cell_df.sort_values("timestamp")
+    score = float(score_readings(ordered, model, scaler)[-1])
     return score, score < 0
 
 
@@ -87,32 +86,14 @@ def severity_from_score(score: float) -> str:
     return "NORMAL"
 
 
-def time_split(df: pd.DataFrame, days: int = TRAIN_SPLIT_DAYS):
+def train_mask(df: pd.DataFrame, days: int = TRAIN_SPLIT_DAYS) -> np.ndarray:
     ts = pd.to_datetime(df["timestamp"])
-    cutoff = ts.min() + timedelta(days=days)
-    return df[ts < cutoff], df[ts >= cutoff]
+    return (ts < ts.min() + timedelta(days=days)).to_numpy()
 
 
-def evaluate(df: pd.DataFrame, model, scaler) -> dict:
-    y = df["is_anomaly"].values
-    y_pred = (score_readings(df, model, scaler) < 0).astype(int)
-    cm = confusion_matrix(y, y_pred, labels=[0, 1])
-    per_scenario = {}
-    for scenario in sorted(df["scenario"].unique()):
-        if scenario == "normal":
-            continue
-        mask = (df["scenario"] == scenario).values
-        per_scenario[scenario] = round(float(y_pred[mask].mean()), 3)
-    return {
-        "precision": round(float(precision_score(y, y_pred, zero_division=0)), 3),
-        "recall":    round(float(recall_score(y, y_pred, zero_division=0)), 3),
-        "f1":        round(float(f1_score(y, y_pred, zero_division=0)), 3),
-        "false_alarm_rate": round(float(cm[0, 1] / max(cm[0, 0] + cm[0, 1], 1)), 4),
-        "confusion": {"tn": int(cm[0, 0]), "fp": int(cm[0, 1]),
-                      "fn": int(cm[1, 0]), "tp": int(cm[1, 1])},
-        "detection_rate_by_scenario": per_scenario,
-        "n_rows": int(len(df)),
-    }
+def time_split(df: pd.DataFrame, days: int = TRAIN_SPLIT_DAYS):
+    mask = train_mask(df, days)
+    return df[mask], df[~mask]
 
 
 def load_model_and_scaler(model_path: str = MODEL_PATH, scaler_path: str = SCALER_PATH):
@@ -121,27 +102,49 @@ def load_model_and_scaler(model_path: str = MODEL_PATH, scaler_path: str = SCALE
     return joblib.load(model_path), joblib.load(scaler_path)
 
 
-# ── Training entry point ──────────────────────────────────────────────────
+# ── Training and comparison ───────────────────────────────────────────────
+
+def compare_detectors(df: pd.DataFrame, features: pd.DataFrame, is_train: np.ndarray):
+    """Fit all three detectors on the training days and evaluate them on the rest."""
+    is_test = ~is_train
+    results = {}
+
+    limits = fit_static_thresholds(df[is_train])
+    results["static_thresholds"] = evaluate_flags(df, static_threshold_flags(df, limits), is_test)
+
+    raw_model, raw_scaler = fit_model(df.loc[is_train, KPI_FEATURES].to_numpy())
+    raw_flags = raw_model.decision_function(raw_scaler.transform(df[KPI_FEATURES].to_numpy())) < 0
+    results["iforest_raw"] = evaluate_flags(df, raw_flags, is_test)
+
+    model, scaler = fit_model(features.loc[is_train, FEATURE_COLUMNS].to_numpy())
+    flags = score_readings(df, model, scaler, features=features) < 0
+    results["iforest_baseline"] = evaluate_flags(df, flags, is_test)
+    return results, model, scaler
+
 
 def train(df: pd.DataFrame | None = None, model_path: str = MODEL_PATH,
           scaler_path: str = SCALER_PATH, metrics_path: str = METRICS_PATH) -> dict:
     df = generate_dataset() if df is None else df
-    train_df, test_df = time_split(df)
+    df = df.sort_values(["cell_id", "timestamp"]).reset_index(drop=True)
+    is_train = train_mask(df)
+    print(f"Train rows: {is_train.sum():,}   Held-out rows: {(~is_train).sum():,}")
 
-    print(f"Train rows: {len(train_df):,}   Held-out rows: {len(test_df):,}")
-    model, scaler = fit_model(train_df[KPI_FEATURES].values)
-    metrics = evaluate(test_df, model, scaler)
-    metrics["trained_at"] = datetime.now().isoformat(timespec="seconds")
-    metrics["split"] = f"train first {TRAIN_SPLIT_DAYS} days, evaluate on the rest"
+    print("Building features ...")
+    features = build_features(df)
 
-    print("\nHeld-out results")
-    print(f"  Precision : {metrics['precision']:.3f}  (target > {PRECISION_TARGET})")
-    print(f"  Recall    : {metrics['recall']:.3f}  (target > {RECALL_TARGET})")
-    print(f"  F1        : {metrics['f1']:.3f}  (target > {F1_TARGET})")
-    print(f"  False alarm rate: {metrics['false_alarm_rate']:.2%}")
-    print("  Detection rate by scenario:")
-    for k, v in metrics["detection_rate_by_scenario"].items():
-        print(f"    {k:<20} {v:.1%}")
+    print("Fitting and evaluating detectors ...")
+    results, model, scaler = compare_detectors(df, features, is_train)
+
+    metrics = {
+        "trained_at": datetime.now().isoformat(timespec="seconds"),
+        "split": f"train first {TRAIN_SPLIT_DAYS} days, evaluate on the rest",
+        "model": "iforest_baseline",
+        "detectors": results,
+    }
+    print("\nHeld-out comparison\n" + format_table(results))
+    print("\nEvent recall by scenario (iforest_baseline):")
+    for k, v in results["iforest_baseline"]["events"]["recall_by_scenario"].items():
+        print(f"  {k:<20} {v:.0%}")
 
     for p in (model_path, scaler_path, metrics_path):
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
@@ -149,7 +152,7 @@ def train(df: pd.DataFrame | None = None, model_path: str = MODEL_PATH,
     joblib.dump(scaler, scaler_path)
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
-    print(f"\nSaved model, scaler and metrics to {os.path.dirname(model_path)}/")
+    print(f"\nSaved model, scaler and metrics to {os.path.dirname(model_path) or '.'}/")
     return metrics
 
 

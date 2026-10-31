@@ -56,17 +56,37 @@ ANOMALY_SCORE_CRITICAL = -0.05   # clearly anomalous
 ZSCORE_FLAG = 2.0          # flag a KPI when the latest reading is > 2 sigma off baseline
 
 # ── Simulation ────────────────────────────────────────────────────────────
-N_CELLS      = 50      # simulated cells
-N_TIMESTAMPS = 1000    # readings per cell (15-min intervals, about 10 days)
-ANOMALY_RATE = 0.08
-RANDOM_SEED  = 42
+N_CELLS        = 100
+N_TIMESTAMPS   = 1344    # readings per cell (15-min intervals, 14 days)
+READINGS_PER_DAY = 96
+ANOMALY_RATE   = 0.06    # target share of readings inside a fault event
+BENIGN_SHARE   = 0.3     # share of events that are harmless load surges (not faults)
+SUBTLE_SHARE   = 0.4     # share of faults with low severity
+EVENT_MIN_LEN  = 4       # readings (1 hour)
+EVENT_MAX_LEN  = 48      # readings (12 hours)
+RANDOM_SEED    = 42
+
+# ── Features ──────────────────────────────────────────────────────────────
+# Baseline for each reading = median of the same time slot (+/- 15 min) on
+# previous days of the same type (weekday or weekend) within the last week.
+# Falls back to the median of the previous 12 readings.
+BASELINE_DAYS   = 7
+FALLBACK_WINDOW = 12
+RESIDUAL_SMOOTH = 4      # rolling mean of residuals over 1 hour
 
 # ── Model ─────────────────────────────────────────────────────────────────
-IF_CONTAMINATION = 0.08
+# Contamination is an alarm budget (share of readings we accept flagging),
+# not something tuned on the labels.
+IF_CONTAMINATION = 0.05
 IF_N_ESTIMATORS  = 300
 IF_MAX_SAMPLES   = 256
 IF_MAX_FEATURES  = 0.7
-TRAIN_SPLIT_DAYS = 7     # train on the first 7 days, evaluate on the rest
+TRAIN_SPLIT_DAYS = 10    # train on the first 10 days, evaluate on the last 4
+
+# ── Alarms (how readings become operator alarms) ──────────────────────────
+ALARM_K = 2              # raise an alarm when K of the last M readings are flagged
+ALARM_M = 3
+ALARM_GRACE = 4          # alarms up to 1 hour after a fault ends are not false alarms
 
 PRECISION_TARGET = 0.80
 RECALL_TARGET    = 0.70

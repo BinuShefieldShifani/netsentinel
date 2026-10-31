@@ -1,0 +1,80 @@
+"""
+features.py - Turn raw KPI readings into "how unusual is this for this cell"
+===========================================================================
+PRB utilisation of 80% is normal at 19:00 in a busy urban cell and very odd
+at 04:00 in a rural one. So each reading is compared with its own cell's
+history at the same time of day:
+
+    baseline  = median of the same 15-min slot (+/- one slot) on earlier
+                days of the same type (weekday or weekend) in the past week;
+                if there is no such history yet, the median of the
+                previous 12 readings
+    residual  = reading - baseline
+    smoothed  = rolling mean of the residual over the last hour
+
+Model input = the raw KPI values plus the smoothed residuals. That pair won
+on validation days 8-10 against raw-only, residual-only and per-cell-scaled
+variants (see experiments/select_features.py).
+
+Only past readings are used, so the features can be computed live.
+"""
+
+import warnings
+
+import numpy as np
+import pandas as pd
+
+from config import BASELINE_DAYS, FALLBACK_WINDOW, KPIS, READINGS_PER_DAY, RESIDUAL_SMOOTH
+
+KPI_FEATURES = list(KPIS.keys())
+RESIDUAL_COLUMNS = [f"{k}_res" for k in KPI_FEATURES]
+SMOOTHED_COLUMNS = [f"{k}_res_mean{RESIDUAL_SMOOTH}" for k in KPI_FEATURES]
+FEATURE_COLUMNS = KPI_FEATURES + SMOOTHED_COLUMNS
+
+
+def seasonal_baseline(cell_df: pd.DataFrame) -> pd.DataFrame:
+    """Baseline per KPI for one cell. Rows must be in time order with no gaps."""
+    values = cell_df[KPI_FEATURES].astype(float)
+    n = len(values)
+    if "timestamp" in cell_df.columns:
+        weekend = (pd.to_datetime(cell_df["timestamp"]).dt.dayofweek >= 5).to_numpy()
+    else:
+        weekend = np.zeros(n, dtype=bool)
+
+    lagged = []
+    for day in range(1, BASELINE_DAYS + 1):
+        for offset in (-1, 0, 1):
+            lag = day * READINGS_PER_DAY + offset
+            past = values.shift(lag).to_numpy(copy=True)
+            same_type = np.zeros(n, dtype=bool)
+            same_type[lag:] = weekend[lag:] == weekend[: n - lag] if lag < n else False
+            past[~same_type] = np.nan
+            lagged.append(past)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)   # all-NaN slices early on
+        base = np.nanmedian(np.stack(lagged), axis=0)
+    fallback = values.shift(1).rolling(FALLBACK_WINDOW, min_periods=1).median().to_numpy()
+    base = np.where(np.isnan(base), fallback, base)
+    base = np.where(np.isnan(base), values.to_numpy(), base)       # very first reading
+    return pd.DataFrame(base, index=cell_df.index, columns=KPI_FEATURES)
+
+
+def _cell_features(cell_df: pd.DataFrame) -> pd.DataFrame:
+    residual = cell_df[KPI_FEATURES].astype(float) - seasonal_baseline(cell_df)
+    residual.columns = RESIDUAL_COLUMNS
+    smoothed = residual.rolling(RESIDUAL_SMOOTH, min_periods=1).mean()
+    smoothed.columns = SMOOTHED_COLUMNS
+    raw = cell_df[KPI_FEATURES].astype(float)
+    return pd.concat([raw, residual, smoothed], axis=1)
+
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Features for every row of df, returned in the same row order.
+    df may hold one cell or many; each cell is handled separately.
+    """
+    if "cell_id" not in df.columns or df["cell_id"].nunique() <= 1:
+        ordered = df.sort_values("timestamp") if "timestamp" in df.columns else df
+        return _cell_features(ordered).loc[df.index]
+    parts = [_cell_features(g.sort_values("timestamp")) for _, g in df.groupby("cell_id", sort=False)]
+    return pd.concat(parts).loc[df.index]

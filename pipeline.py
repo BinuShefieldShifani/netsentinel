@@ -2,9 +2,9 @@
 pipeline.py - NetSentinel LangGraph agent pipeline
 ==================================================
 
-  [kpi_monitor]        robust z-score of the latest reading vs the cell's baseline
+  [kpi_monitor]        robust z-score of the latest reading vs the cell's time-of-day baseline
        |
-  [anomaly_scorer]     Isolation Forest on the latest reading
+  [anomaly_scorer]     Isolation Forest on the latest reading (raw KPIs + baseline deviation)
        |
    (router)
        |-- anomalous -> [root_cause_classifier]  LLM, validated, rule-based fallback
@@ -41,6 +41,7 @@ from config import (
     OLLAMA_MODEL,
     ZSCORE_FLAG,
 )
+from features import RESIDUAL_COLUMNS, build_features
 from knowledge_base import format_for_llm, retrieve_procedure
 from model_trainer import load_model_and_scaler, score_cell_window, severity_from_score
 
@@ -116,20 +117,23 @@ def parse_json(text: Optional[str]) -> Optional[dict]:
 
 def robust_zscores(df) -> tuple[dict, dict]:
     """
-    z-score of the latest reading against all earlier readings of the cell.
-    Uses median and MAD so that past anomalies in the baseline don't
-    inflate the spread and hide the current one.
+    How unusual the latest reading is for this cell, per KPI.
+    Each KPI's deviation from the cell's time-of-day baseline (features.py)
+    is divided by the typical size of that deviation in the cell's history.
+    Median and MAD are used so past faults in the history don't inflate the
+    spread and hide the current one.
     """
-    latest = df.iloc[-1]
-    baseline = df.iloc[:-1] if len(df) > 1 else df
+    ordered = df.sort_values("timestamp") if "timestamp" in df.columns else df
+    residuals = build_features(ordered)[RESIDUAL_COLUMNS].to_numpy()
+    latest, history = residuals[-1], (residuals[:-1] if len(residuals) > 1 else residuals)
+    med = np.median(history, axis=0)
+    mad = np.median(np.abs(history - med), axis=0) * 1.4826
+    last_row = ordered.iloc[-1]
     snapshot, zscores = {}, {}
-    for kpi in KPIS:
-        values = baseline[kpi].astype(float).values
-        med = float(np.median(values))
-        mad = float(np.median(np.abs(values - med))) * 1.4826
-        spread = max(mad, 0.1 * KPIS[kpi][3], 1e-6)   # floor at 10% of nominal std
-        snapshot[kpi] = round(float(latest[kpi]), 3)
-        zscores[kpi] = round((float(latest[kpi]) - med) / spread, 2)
+    for j, kpi in enumerate(KPIS):
+        spread = max(float(mad[j]), 0.1 * KPIS[kpi][3], 1e-6)   # floor at 10% of nominal std
+        snapshot[kpi] = round(float(last_row[kpi]), 3)
+        zscores[kpi] = round(float((latest[j] - med[j]) / spread), 2)
     return snapshot, zscores
 
 
@@ -188,16 +192,21 @@ def rule_based_classify(z: dict) -> str:
     """
     Signature rules over the robust z-scores of the latest reading.
     Used when the LLM is unavailable or returns something invalid.
+
+      signal power down + handovers failing  -> coverage gap
+      signal power down, handovers fine      -> hardware fault
+      DL and UL PRB both saturating          -> capacity overload
+      handovers failing, signal fine         -> handover storm
+      SINR and RSRQ down, signal fine        -> interference
     """
-    if z["prb_dl"] > 2 and z["prb_ul"] > 2:
+    if z["rsrp"] < -3:
+        return "coverage_gap" if z["ho_sr"] < -3 else "hardware_fault"
+    if z["prb_dl"] > 2.5 and z["prb_ul"] > 2:
         return "capacity_overload"
-    if z["rsrp"] < -2.5:
-        # both lose signal power; hardware faults also degrade RSRQ
-        return "hardware_fault" if z["rsrq"] < -1.5 else "coverage_gap"
+    if z["ho_sr"] < -4:
+        return "handover_storm"
     if z["sinr"] < -2 and z["rsrq"] < -1.5:
         return "interference"
-    if z["ho_sr"] < -2:
-        return "handover_storm"
     return UNCLASSIFIED
 
 

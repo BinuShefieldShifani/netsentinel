@@ -12,7 +12,7 @@ Isolation Forest · LangGraph · Ollama · Streamlit · pytest · GitHub Actions
 ## Pipeline
 
 ```
-[kpi_monitor]        robust z-score of the latest reading vs the cell's own history
+[kpi_monitor]        how unusual is the latest reading for this cell at this time of day?
       |
 [anomaly_scorer]     Isolation Forest score of the latest reading
       |
@@ -58,39 +58,74 @@ See `tests/test_pipeline.py` for the tests behind each point.
 | CQI | Channel Quality Indicator | | low |
 | HO-SR | Handover Success Rate | % | low |
 | RLF rate | Radio Link Failure rate | % | high |
-| TP DL / UL | Throughput | Mbps | low |
+| TP DL / UL | User throughput | Mbps | low |
 
-Failure modes simulated: interference, capacity overload, hardware fault,
-coverage gap, handover storm.
+## Simulated data
 
-## Results, and why you shouldn't be impressed by them yet
+Real operator KPI data isn't public, so the data is simulated: 100 cells,
+15-minute readings, 14 days. The simulator tries to keep what makes the
+problem hard in practice:
 
-The model is trained on the first 7 days and evaluated on the last 3 days of
-50 cells (`models/metrics.json`):
+- **KPIs depend on each other.** Each cell has three hidden drivers (traffic
+  load, interference, received signal power) and the KPIs follow from them.
+  Worse SINR means lower CQI, lower CQI means more PRBs and less throughput.
+  In normal operation SINR and CQI correlate at about 0.93.
+- **Traffic follows the clock.** Morning and evening peaks on weekdays, a
+  later and flatter curve at weekends. Evening PRB load is more than twice
+  the night-time load.
+- **Faults are events.** A fault ramps up, lasts 1 to 12 hours and recovers.
+  About 40% are subtle. Faults change the hidden drivers, so the effect
+  spreads to the dependent KPIs.
+- **Not every surge is a fault.** About 30% of events are harmless load
+  surges (think of a football match). They are not labelled as anomalies.
 
-| Metric | Held-out |
-|--------|----------|
-| Precision | 0.969 |
-| Recall | 1.000 |
-| F1 | 0.984 |
-| False alarm rate | 0.29% |
+Failure modes: interference, capacity overload, hardware fault, coverage
+gap, handover storm. About 6% of readings fall inside a fault.
 
-These numbers say more about the data than the model. On the same dataset a
-single threshold, `rlf_rate > 2`, already reaches F1 0.89 with no ML at all.
-The reasons:
+## Detection
 
-- injected faults are very large (RLF rate moves about 13 standard deviations)
-- each fault lasts exactly one 15-minute reading, while real faults build up
-  and persist
-- KPIs are generated independently, so in normal data SINR, CQI and
-  throughput don't move together the way they do in a real cell
+PRB at 80% is normal at 19:00 in a busy city cell and strange at 04:00 in a
+rural one. So `features.py` compares each reading with the same time slot on
+earlier days of the same type (weekday or weekend) for that cell, and the
+model sees both the raw KPIs and the smoothed deviation from that baseline.
+Only past readings are used, so this works live.
 
-Making the simulation harder and more realistic is the next step (see
-Roadmap). Expect the scores to drop when that happens.
+The feature set was picked on validation days 8 to 10
+(`experiments/select_features.py`) before the held-out days were looked at.
 
-With the LLM offline, the rule-based fallback picks the right failure mode in
-about 87% of held-out faults, and healthy cells are reported as NORMAL in
-about 97% of cases (the rest get a WARNING and go to a human).
+## Results
+
+Trained on days 1 to 10, evaluated on days 11 to 14 (91 fault events). An
+alarm is raised when 2 of a cell's last 3 readings are flagged.
+
+| Detector | Point F1 | Faults caught | Severe | Subtle | Median delay | False alarms per cell per day | Harmless surges alarmed |
+|---|---|---|---|---|---|---|---|
+| Static thresholds | 0.47 | 45% | 71% | 13% | 60 min | 0.04 | 12% |
+| Isolation Forest, raw KPIs | 0.59 | 77% | 96% | 53% | 45 min | 0.22 | 24% |
+| **Isolation Forest + baseline** | **0.69** | **80%** | **96%** | **60%** | 60 min | **0.13** | 24% |
+
+What this shows:
+
+- Fixed thresholds are quiet but miss more than half the faults, almost all
+  of the subtle ones.
+- Comparing each cell with its own normal behaviour catches as many faults as
+  the raw model with roughly 40% fewer false alarms.
+- Capacity overload is the hardest fault to catch (68%), because it looks a
+  lot like a harmless surge. A quarter of the harmless surges still raise an
+  alarm.
+- 0.13 false alarms per cell per day sounds small, but across 10,000 cells it
+  would be about 1,300 a day. This is a portfolio project, not something an
+  operator could deploy as is.
+- 91 events is a small sample, so treat differences of a few points as noise.
+
+An earlier version of this project reported F1 0.98. That came from faults
+that were huge, lasted a single reading and sat on top of independent noise:
+one threshold on RLF rate alone reached F1 0.89. Those numbers were removed
+when the simulator was rebuilt.
+
+With the LLM offline, the rule-based fallback names the right failure mode
+for about 84% of severe faults and about a third of subtle ones. Most of
+the subtle misses come back as "unclassified", which goes to a human.
 
 ## Setup
 
@@ -100,9 +135,9 @@ Python 3.11 or newer.
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-python model_trainer.py      # generates data/ and trains models/
+python model_trainer.py      # generates data/, trains models/, prints the comparison
 streamlit run app.py         # dashboard
-pytest                       # 54 tests, no LLM needed
+pytest                       # 71 tests, no LLM needed
 ```
 
 The LLM is optional. To use one, run Ollama and set:
@@ -114,11 +149,13 @@ export OLLAMA_MODEL=gpt-oss:20b     # any chat model you have pulled
 
 ## Tests and CI
 
-`pytest` covers the data generator (ranges, reproducibility, fault
-signatures), the model (score scale, severity thresholds, held-out metrics),
-the knowledge base, and the agent pipeline end to end with a mocked LLM:
-offline, garbage output, invented failure modes, and an LLM that tries to
-override the plan.
+`pytest` covers the simulator (ranges, correlations, daily pattern, fault
+events), the features (no look-ahead, weekday vs weekend baseline), the
+alarm and event metrics (on small hand-made cases), the model (score scale,
+severity thresholds, a quality gate that fails CI if the model stops beating
+fixed thresholds), the knowledge base, and the agent pipeline end to end with
+a mocked LLM: offline, garbage output, invented failure modes, and an LLM
+that tries to override the plan.
 
 Several tests are regression tests for bugs found when this repo was first
 reviewed: every healthy cell was reported CRITICAL (wrong score scale), every
@@ -131,9 +168,12 @@ and uploads the metrics file from each run.
 ## Project layout
 
 ```
-config.py            KPI definitions, thresholds, model settings
+config.py            KPI definitions, thresholds, simulation and model settings
 data_generator.py    synthetic KPI simulation
-model_trainer.py     Isolation Forest training, scoring, held-out evaluation
+features.py          per-cell time-of-day baseline and deviation features
+evaluation.py        alarms, event-level metrics, baseline detectors
+model_trainer.py     training, scoring, held-out comparison
+experiments/         feature selection on validation days
 knowledge_base.py    remediation procedures per failure mode
 pipeline.py          LangGraph agent
 app.py               Streamlit dashboard
@@ -142,15 +182,17 @@ tests/               pytest suite
 
 ## Known limitations
 
-- Synthetic data only; see Results.
+- Synthetic data only. The simulator's structure is hand-made, so results
+  show how detectors compare on this data, not how they would do on a real
+  network.
+- The model scores single readings (with smoothed history as features); it
+  doesn't model sequences.
 - Remediation parameter names are illustrative, not from a specific vendor OSS.
 - Nothing is actually applied to a network. "Apply" means the plan is
   marked for automatic execution.
 
 ## Roadmap
 
-- More realistic simulation: correlated KPIs, faults that build up over
-  several readings, subtle degradations, time-split evaluation on that data
 - Measure LLM classification accuracy against the rule-based baseline
 - C++ scoring component (CMake, GoogleTest, pybind11)
 - Jenkins pipeline alongside GitHub Actions

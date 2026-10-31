@@ -68,8 +68,17 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### Display Window")
-    n_readings = st.slider("Readings to show", 20, 200, 60,
+    n_readings = st.slider("Readings to show", 20, 400, 96,
                            help="Each reading = 15 min interval")
+    full_cell_df = df[df["cell_id"] == cell_id].sort_values("timestamp").reset_index(drop=True)
+    end_at = st.slider("Analyse up to reading", 50, len(full_cell_df), len(full_cell_df),
+                       help="Move back in time to replay a fault. The agent sees all readings up to this point.")
+    fault_starts = full_cell_df.index[
+        (full_cell_df["is_anomaly"] == 1) & (full_cell_df["is_anomaly"].shift(1, fill_value=0) == 0)
+    ].tolist()
+    if fault_starts:
+        st.caption("Fault events in this cell start at readings: "
+                   + ", ".join(str(i + 1) for i in fault_starts[:12]))
 
     st.markdown("---")
     st.markdown("### Agent Config")
@@ -82,19 +91,23 @@ with st.sidebar:
     if os.path.exists(METRICS_PATH):
         with open(METRICS_PATH) as f:
             m = json.load(f)
+        pm = m["detectors"]["iforest_baseline"]["point"]
         st.markdown(
             f"| Metric | Value |\n|---|---|\n"
-            f"| Precision | {m['precision']:.3f} |\n| Recall | {m['recall']:.3f} |\n"
-            f"| F1 | {m['f1']:.3f} |\n| False alarms | {m['false_alarm_rate']:.2%} |"
+            f"| Precision | {pm['precision']:.3f} |\n| Recall | {pm['recall']:.3f} |\n"
+            f"| F1 | {pm['f1']:.3f} |"
         )
-        st.caption("Synthetic data with large, single-reading faults. "
-                   "Scores this high mean the data is too easy, not that the model is.")
+        ev = m["detectors"]["iforest_baseline"]["events"]
+        st.caption(f"Fault events caught: {ev['event_recall']:.0%} · "
+                   f"false alarms per cell per day: {ev['false_alarms_per_cell_day']} · "
+                   "synthetic data, see README")
     else:
         st.caption("Run `python model_trainer.py` to compute metrics.")
 
 # ── Cell Data ─────────────────────────────────────────────────────────────
 
-cell_df = df[df["cell_id"] == cell_id].sort_values("timestamp").tail(n_readings).copy()
+history_df = full_cell_df.iloc[:end_at]
+cell_df = history_df.tail(n_readings).copy()
 has_anomaly = bool(cell_df["is_anomaly"].any())
 anomaly_pct = cell_df["is_anomaly"].mean() * 100
 
@@ -180,14 +193,15 @@ with tab2:
     st.markdown("Below 0 = predicted anomaly. Dashed lines show Warning and Critical thresholds.")
 
     @st.cache_data
-    def compute_scores(cell_id, n):
+    def compute_scores(cell_id, end_at, n):
         from model_trainer import load_model_and_scaler, score_readings
         model, scaler = load_model_and_scaler()
-        cdf    = df[df["cell_id"] == cell_id].sort_values("timestamp").tail(n).copy()
-        scores = score_readings(cdf, model, scaler)
-        return cdf["timestamp"].tolist(), scores, cdf["is_anomaly"].values
+        hist = df[df["cell_id"] == cell_id].sort_values("timestamp").iloc[:end_at]
+        scores = score_readings(hist, model, scaler)[-n:]   # score with full history, show the tail
+        shown = hist.tail(n)
+        return shown["timestamp"].tolist(), scores, shown["is_anomaly"].values
 
-    timestamps, scores, true_labels = compute_scores(cell_id, n_readings)
+    timestamps, scores, true_labels = compute_scores(cell_id, end_at, n_readings)
 
     fig_score = go.Figure()
     fig_score.add_trace(go.Scatter(
@@ -342,7 +356,7 @@ if run_btn:
     with st.spinner(f"Running 4-node agent pipeline for {cell_id} ..."):
         try:
             from pipeline import run_analysis
-            result = run_analysis(cell_id, cell_df)
+            result = run_analysis(cell_id, history_df)
             st.session_state["agent_result"] = result
             sev = result.get("severity", "?")
             fm  = result.get("failure_mode", "?")

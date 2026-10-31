@@ -7,7 +7,8 @@ history at the same time of day:
 
     baseline  = median of the same 15-min slot (+/- one slot) on earlier
                 days of the same type (weekday or weekend) in the past week;
-                if there is no such history yet, the median of the
+                if there is no same-type day yet, the same slot on any
+                earlier day; only on the very first day, the median of the
                 previous 12 readings
     residual  = reading - baseline
     smoothed  = rolling mean of the residual over the last hour
@@ -33,7 +34,19 @@ FEATURE_COLUMNS = KPI_FEATURES + SMOOTHED_COLUMNS
 
 
 def seasonal_baseline(cell_df: pd.DataFrame) -> pd.DataFrame:
-    """Baseline per KPI for one cell. Rows must be in time order with no gaps."""
+    """
+    Baseline per KPI for one cell. Rows must be in time order with no gaps.
+
+    Order of preference for each reading:
+      1. same 15-min slot (+/- one) on earlier days of the same type
+         (weekday or weekend) within BASELINE_DAYS
+      2. same slot on any earlier day, if there is no same-type day yet
+         (e.g. the first weekend)
+      3. median of the previous FALLBACK_WINDOW readings, only when there is
+         no earlier day at all
+    Option 3 adapts to whatever is happening right now, including a fault,
+    so it is only used during the very first day.
+    """
     values = cell_df[KPI_FEATURES].astype(float)
     n = len(values)
     if "timestamp" in cell_df.columns:
@@ -41,18 +54,23 @@ def seasonal_baseline(cell_df: pd.DataFrame) -> pd.DataFrame:
     else:
         weekend = np.zeros(n, dtype=bool)
 
-    lagged = []
+    same_type, any_type = [], []
     for day in range(1, BASELINE_DAYS + 1):
         for offset in (-1, 0, 1):
             lag = day * READINGS_PER_DAY + offset
             past = values.shift(lag).to_numpy(copy=True)
-            same_type = np.zeros(n, dtype=bool)
-            same_type[lag:] = weekend[lag:] == weekend[: n - lag] if lag < n else False
-            past[~same_type] = np.nan
-            lagged.append(past)
+            any_type.append(past.copy())
+            match = np.zeros(n, dtype=bool)
+            if lag < n:
+                match[lag:] = weekend[lag:] == weekend[: n - lag]
+            past[~match] = np.nan
+            same_type.append(past)
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)   # all-NaN slices early on
-        base = np.nanmedian(np.stack(lagged), axis=0)
+        base = np.nanmedian(np.stack(same_type), axis=0)
+        any_day = np.nanmedian(np.stack(any_type), axis=0)
+    base = np.where(np.isnan(base), any_day, base)
     fallback = values.shift(1).rolling(FALLBACK_WINDOW, min_periods=1).median().to_numpy()
     base = np.where(np.isnan(base), fallback, base)
     base = np.where(np.isnan(base), values.to_numpy(), base)       # very first reading

@@ -90,6 +90,12 @@ earlier days of the same type (weekday or weekend) for that cell, and the
 model sees both the raw KPIs and the smoothed deviation from that baseline.
 Only past readings are used, so this works live.
 
+If a cell has no earlier day of the same type yet (its first weekend), the
+baseline uses the same time slot on any earlier day. An earlier version used
+the last 12 readings instead, so a long fault slowly became its own baseline
+and stopped being detected after about three hours. There is a regression
+test for that.
+
 The feature set was picked on validation days 8 to 10
 (`experiments/select_features.py`) before the held-out days were looked at.
 
@@ -102,19 +108,19 @@ alarm is raised when 2 of a cell's last 3 readings are flagged.
 |---|---|---|---|---|---|---|---|
 | Static thresholds | 0.47 | 45% | 71% | 13% | 60 min | 0.04 | 12% |
 | Isolation Forest, raw KPIs | 0.59 | 77% | 96% | 53% | 45 min | 0.22 | 24% |
-| **Isolation Forest + baseline** | **0.69** | **80%** | **96%** | **60%** | 60 min | **0.13** | 24% |
+| **Isolation Forest + baseline** | **0.68** | **78%** | **94%** | **58%** | 60 min | **0.11** | **15%** |
 
 What this shows:
 
 - Fixed thresholds are quiet but miss more than half the faults, almost all
   of the subtle ones.
-- Comparing each cell with its own normal behaviour catches as many faults as
-  the raw model with roughly 40% fewer false alarms.
-- Capacity overload is the hardest fault to catch (68%), because it looks a
-  lot like a harmless surge. A quarter of the harmless surges still raise an
-  alarm.
-- 0.13 false alarms per cell per day sounds small, but across 10,000 cells it
-  would be about 1,300 a day. This is a portfolio project, not something an
+- Comparing each cell with its own normal behaviour catches about as many
+  faults as the raw model, with half the false alarms and fewer than two
+  thirds of the alarms on harmless surges.
+- Capacity overload is the hardest fault to catch (64%), because it looks a
+  lot like a harmless surge.
+- 0.11 false alarms per cell per day sounds small, but across 10,000 cells it
+  would be about 1,100 a day. This is a portfolio project, not something an
   operator could deploy as is.
 - 91 events is a small sample, so treat differences of a few points as noise.
 

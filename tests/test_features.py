@@ -61,3 +61,19 @@ def test_works_without_timestamp_or_cell_id():
                        ["rsrp", "rsrq", "sinr", "prb_dl", "prb_ul", "cqi", "ho_sr", "rlf_rate", "tp_dl", "tp_ul"]})
     out = build_features(df)
     assert len(out) == 30 and not out.isna().any().any()
+
+
+def test_long_fault_on_first_weekend_is_not_absorbed_by_baseline(dataset):
+    """
+    Regression: on the first weekend there is no earlier weekend day, and the
+    baseline used to fall back to the last 12 readings. During a long fault
+    those readings are the fault itself, so the fault started to look normal.
+    """
+    cell = dataset[dataset["cell_id"] == "CELL_0001"].copy()
+    saturday_9am = 5 * READINGS_PER_DAY + 36
+    fault = cell.index[saturday_9am: saturday_9am + 32]            # 8 hours
+    cell.loc[fault, "sinr"] = cell.loc[fault, "sinr"] - 15
+    residual = cell["sinr"] - seasonal_baseline(cell)["sinr"]
+    late_in_fault = residual.loc[fault[-8:]]                       # last 2 hours of the fault
+    assert late_in_fault.mean() < -10
+    assert (late_in_fault < -4).all()

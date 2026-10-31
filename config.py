@@ -69,7 +69,8 @@ RANDOM_SEED    = 42
 # ── Features ──────────────────────────────────────────────────────────────
 # Baseline for each reading = median of the same time slot (+/- 15 min) on
 # previous days of the same type (weekday or weekend) within the last week.
-# Falls back to the median of the previous 12 readings.
+# Falls back to the same slot on any earlier day, and only on the very first
+# day to the median of the previous 12 readings.
 BASELINE_DAYS   = 7
 FALLBACK_WINDOW = 12
 RESIDUAL_SMOOTH = 4      # rolling mean of residuals over 1 hour

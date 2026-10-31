@@ -186,6 +186,30 @@ export NETSENTINEL_LLM=anthropic     # also set ANTHROPIC_API_KEY, optionally AN
 export NETSENTINEL_LLM=none          # rules only
 ```
 
+## Using the dashboard
+
+The sidebar works like a time machine. Pick a cell and a **current reading**:
+the agent sees every reading up to that one and nothing after it. **Jump into
+a labelled event** sets the current reading to about 2 hours into a fault,
+which is the quickest way to watch the agent catch one. **Chart history**
+only changes how far back the charts reach.
+
+Red bands on the charts are labelled faults and grey bands are harmless
+surges. These are ground truth for checking the model; the model never sees
+them. The Model view tab lists each labelled event in the window and when
+(or whether) the model raised an alarm for it.
+
+Some cases worth replaying (cell, reading):
+
+| Case | Cell | Reading |
+|---|---|---|
+| Interference | CELL_0002 | 518 |
+| Coverage gap | CELL_0001 | 477 |
+| Hardware fault | CELL_0001 | 629 |
+| Capacity overload | CELL_0002 | 939 |
+| Handover storm | CELL_0015 | 902 |
+| Harmless surge, no alarm | CELL_0001 | 1262 |
+
 ## Tests and CI
 
 `pytest` covers the simulator (ranges, correlations, daily pattern, fault

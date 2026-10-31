@@ -138,8 +138,9 @@ one threshold on RLF rate alone reached F1 0.89. Those numbers were removed
 when the simulator was rebuilt.
 
 With the LLM offline, the rule-based fallback names the right failure mode
-for about 84% of severe faults and about a third of subtle ones. Most of
-the subtle misses come back as "unclassified", which goes to a human.
+for 86% of severe faults and 28% of subtle ones (86 held-out faults, see
+`llm_eval.py`). Most of the subtle misses come back as "unclassified", which
+goes to a human.
 
 ## Measuring the LLM against the rules
 

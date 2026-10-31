@@ -40,8 +40,10 @@ to make decisions about a live cell. Concretely:
    auto-apply and replace the actions; both are ignored.
 3. **Auto-apply needs two conditions.** A plan is applied without a human
    only if the confidence is HIGH *and* the procedure is marked
-   auto-applicable. Hardware faults are never auto-applicable, whatever the
-   LLM says. Everything else is escalated.
+   auto-applicable. Only load balancing (capacity overload) and handover
+   tuning (handover storm) are, since those match SON functions operators
+   commonly automate. Interference, hardware faults and coverage gaps need
+   their cause confirmed by a person first, whatever the LLM says.
 4. **It works without the LLM.** With Ollama switched off, the pipeline still
    detects, classifies and escalates. CI runs the whole suite this way.
 
@@ -207,4 +209,7 @@ tests/               pytest suite
 
 - 3GPP TS 28.552, 5G performance measurements
 - 3GPP TS 38.300, NR overall description
+- 3GPP TS 38.331, NR RRC (measurement events and handover parameters)
+- 3GPP TS 38.423, XnAP
+- 3GPP TS 28.313, SON for 5G networks
 - O-RAN Alliance, use cases and deployment scenarios

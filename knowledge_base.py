@@ -5,7 +5,18 @@ Maps each failure mode to a remediation procedure. In a real deployment
 this would come from the operator's OSS runbooks. Parameter names here are
 illustrative, not taken from any specific vendor's OSS.
 
-References: 3GPP TS 38.300 (NR overall description), TS 36.423 (X2 interface).
+Auto-apply policy: only the two procedures that match standard SON
+functions operators commonly automate are auto-applicable:
+  capacity overload -> Mobility Load Balancing (MLB)
+  handover storm    -> Mobility Robustness Optimisation (MRO)
+Everything else needs a human, because the cause has to be confirmed first
+(an interference source, a hardware alarm, a neighbour outage).
+
+References:
+  3GPP TS 38.300  NR overall description (incl. SON, Xn)
+  3GPP TS 38.331  NR RRC (measurement events A3, time-to-trigger, hysteresis)
+  3GPP TS 38.423  XnAP (signalling between NR base stations)
+  3GPP TS 28.313  SON for 5G networks
 """
 
 from dataclasses import dataclass
@@ -28,87 +39,84 @@ PROCEDURES: list[RemediationProcedure] = [
     RemediationProcedure(
         id="REM-001",
         failure_mode="interference",
-        title="Interference Mitigation — Power and Tilt Adjustment",
+        title="Interference: locate the source before changing the cell",
         severity="HIGH",
-        auto_applicable=True,
-        parameters=["txPowerAdjustment", "antennaElectricalTilt", "icic_enable"],
+        auto_applicable=False,
+        parameters=["neighbourTxPower", "neighbourElectricalTilt", "interCellInterferenceCoordination"],
         actions=[
-            "Reduce Tx power by 2 dB on serving cell to limit interference footprint.",
-            "Increase electrical antenna downtilt by 2° to reduce side-lobe interference.",
-            "Enable ICIC (Inter-Cell Interference Coordination) on X2 interface.",
-            "Trigger neighbour cell measurement report for interference source identification.",
-            "If SINR remains < 0 dB after 30 min — escalate to RF optimisation team.",
+            "Check whether neighbour cells changed power, tilt or load at the same time (internal interference).",
+            "Look at uplink noise rise per PRB; a flat rise across the band points to an external source.",
+            "If a neighbour is the source: coordinate over Xn, e.g. reduce that neighbour's power or adjust its tilt.",
+            "If the source is external: request a spectrum scan; report persistent external interference to the regulator.",
+            "Escalate to RF optimisation if SINR stays below 0 dB for more than 30 minutes.",
         ],
-        expected_improvement="SINR improvement of 3–6 dB within 2 measurement intervals.",
+        expected_improvement="SINR back to the cell's normal level once the source is removed or coordinated.",
     ),
 
     RemediationProcedure(
         id="REM-002",
         failure_mode="capacity_overload",
-        title="Capacity Overload — Load Balancing and Admission Control",
+        title="Capacity overload: mobility load balancing (MLB)",
         severity="CRITICAL",
         auto_applicable=True,
-        parameters=["loadBalancingThreshold", "admissionControlMaxPrb", "hoA3Offset"],
+        parameters=["cellIndividualOffset", "mlbThreshold", "admissionControlMaxPrb"],
         actions=[
-            "Trigger MLB (Mobility Load Balancing) — offload UEs to adjacent cells.",
-            "Lower A3 handover offset by 2 dB to push border UEs to neighbours earlier.",
-            "Tighten admission control: cap new session PRB allocation at 85%.",
-            "Activate CA (Carrier Aggregation) if secondary carrier available.",
-            "Alert capacity planning team if PRB > 90% persists for > 3 consecutive intervals.",
+            "Trigger MLB: lower the cell individual offset (CIO) towards less loaded neighbours.",
+            "Check that the target neighbours have spare PRB capacity before moving users.",
+            "Tighten admission control for new low-priority sessions while PRB stays above 90%.",
+            "Use carrier aggregation or another band if the site has a second carrier.",
+            "Raise a capacity planning ticket if PRB stays above 90% for 3+ intervals on most days.",
         ],
-        expected_improvement="PRB utilisation reduced to < 80% within 3 measurement intervals.",
+        expected_improvement="PRB utilisation below 80% within about 3 intervals.",
     ),
 
     RemediationProcedure(
         id="REM-003",
         failure_mode="hardware_fault",
-        title="Hardware Fault — Field Engineer Dispatch",
+        title="Hardware fault: confirm with alarms, then dispatch",
         severity="CRITICAL",
         auto_applicable=False,
-        parameters=["cellAdminState", "alarmSuppression"],
+        parameters=["cellAdminState", "neighbourCoverageCompensation"],
         actions=[
-            "GROUND CELL: set cellAdminState to LOCKED to prevent further UE attachment.",
-            "Trigger neighbour cells to increase coverage area (coverage extension).",
-            "Create field engineer dispatch ticket — hardware inspection required.",
-            "Check RU (Radio Unit) alarm logs: temperature, VSWR, power amplifier status.",
-            "Validate antenna connector and feeder cable integrity.",
-            "If RSRP < -110 dBm on all sectors — suspect complete antenna failure.",
+            "Check radio unit alarms: VSWR, power amplifier, temperature, fronthaul link.",
+            "Compare all sectors of the site; one sector down points to antenna or feeder, all down to baseband or power.",
+            "Create a field dispatch ticket with the alarm details.",
+            "If the cell is unusable, lock it and let neighbours compensate coverage.",
         ],
-        expected_improvement="N/A until hardware repaired. Neighbour coverage extension active.",
+        expected_improvement="No improvement until repaired; neighbour compensation limits the impact.",
     ),
 
     RemediationProcedure(
         id="REM-004",
         failure_mode="coverage_gap",
-        title="Coverage Gap — Remote Electrical Tilt and Power Boost",
+        title="Coverage gap: check neighbours, then adjust tilt",
         severity="HIGH",
-        auto_applicable=True,
-        parameters=["antennaElectricalTilt", "txPowerAdjustment", "coverageExtension"],
+        auto_applicable=False,
+        parameters=["antennaElectricalTilt", "txPower", "neighbourRelations"],
         actions=[
-            "Reduce electrical downtilt by 3° to extend coverage radius.",
-            "Increase Tx power by 2 dB (within regulatory EIRP limits).",
-            "Enable coverage extension for cell-edge UEs (CE level +5 dB).",
-            "Trigger neighbour list audit — add missing neighbours for seamless HO.",
-            "Schedule drive test for coverage validation if gap persists > 24h.",
+            "Check whether a neighbour cell is down or degraded; that is the most common cause of a sudden gap.",
+            "Audit neighbour relations (ANR) so cell-edge users have a handover target.",
+            "Reduce electrical downtilt by 1-2 degrees to extend coverage, within interference limits.",
+            "Increase transmit power within the licensed EIRP limit if tilt is not enough.",
+            "Schedule a drive test if the gap lasts more than 24 hours.",
         ],
-        expected_improvement="RSRP improvement of 4–8 dBm at cell edge within 1 interval.",
+        expected_improvement="RSRP at the cell edge back to normal and handover success above 97%.",
     ),
 
     RemediationProcedure(
         id="REM-005",
         failure_mode="handover_storm",
-        title="Handover Storm — HO Parameter Optimisation",
+        title="Handover storm: mobility robustness optimisation (MRO)",
         severity="HIGH",
         auto_applicable=True,
-        parameters=["hoA3Offset", "hoTimeToTrigger", "hoHysteresis", "pingPongTimer"],
+        parameters=["a3Offset", "timeToTrigger", "hysteresis"],
         actions=[
-            "Increase A3 handover offset by 3 dB to raise HO trigger threshold.",
-            "Increase Time-to-Trigger (TTT) from 160ms to 320ms to filter transient fluctuations.",
-            "Set hysteresis to 3 dB to prevent ping-pong between cells.",
-            "Enable ping-pong prevention timer (minimum 60s between reverse HOs).",
-            "Audit neighbour cell list — remove spurious neighbours causing unnecessary HOs.",
+            "Increase A3 offset by 1-2 dB on the affected neighbour pairs.",
+            "Increase time-to-trigger, e.g. from 160 ms to 320 ms, to filter short fluctuations.",
+            "Increase hysteresis to reduce ping-pong handovers.",
+            "Remove neighbour relations that cause unnecessary handovers.",
         ],
-        expected_improvement="Handover success rate > 97% and RLF rate < 0.5% within 5 intervals.",
+        expected_improvement="Handover success above 97% and RLF rate back to normal within about 5 intervals.",
     ),
 ]
 

@@ -117,23 +117,24 @@ def _first(dataset, scenario):
 
 
 def test_high_confidence_auto_applicable_fix_is_applied(dataset, fake_llm):
-    p = fake_llm(classifier=json.dumps({"failure_mode": "interference", "confidence": "HIGH", "summary": "s"}))
-    out = p.run_analysis(*_first(dataset, "interference"))
+    p = fake_llm(classifier=json.dumps({"failure_mode": "handover_storm", "confidence": "HIGH", "summary": "s"}))
+    out = p.run_analysis(*_first(dataset, "handover_storm"))
     assert out["classification_source"] == "llm"
     assert out["action_plan"]["apply_immediately"] is True
     assert out["action_plan"]["escalate_to_human"] is False
 
 
-def test_hardware_fault_is_never_auto_applied_even_at_high_confidence(dataset, fake_llm):
-    p = fake_llm(classifier=json.dumps({"failure_mode": "hardware_fault", "confidence": "HIGH"}))
-    plan = p.run_analysis(*_first(dataset, "hardware_fault"))["action_plan"]
+@pytest.mark.parametrize("mode", ["hardware_fault", "interference", "coverage_gap"])
+def test_cause_must_be_confirmed_by_a_human_even_at_high_confidence(dataset, fake_llm, mode):
+    p = fake_llm(classifier=json.dumps({"failure_mode": mode, "confidence": "HIGH"}))
+    plan = p.run_analysis(*_first(dataset, mode))["action_plan"]
     assert plan["apply_immediately"] is False
     assert plan["escalate_to_human"] is True
 
 
 def test_medium_confidence_is_escalated(dataset, fake_llm):
-    p = fake_llm(classifier=json.dumps({"failure_mode": "interference", "confidence": "MEDIUM"}))
-    plan = p.run_analysis(*_first(dataset, "interference"))["action_plan"]
+    p = fake_llm(classifier=json.dumps({"failure_mode": "capacity_overload", "confidence": "MEDIUM"}))
+    plan = p.run_analysis(*_first(dataset, "capacity_overload"))["action_plan"]
     assert plan["apply_immediately"] is False
     assert plan["escalate_to_human"] is True
 

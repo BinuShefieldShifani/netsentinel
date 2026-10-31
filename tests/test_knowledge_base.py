@@ -9,8 +9,15 @@ def test_every_scenario_has_a_procedure():
         assert proc.actions and proc.parameters
 
 
-def test_hardware_fault_is_never_auto_applicable():
-    assert retrieve_procedure("hardware_fault").auto_applicable is False
+def test_only_son_style_procedures_are_auto_applicable():
+    auto = {mode for mode in ANOMALY_SCENARIOS if retrieve_procedure(mode).auto_applicable}
+    assert auto == {"capacity_overload", "handover_storm"}
+
+
+def test_no_lte_only_terms():
+    """NR uses Xn between base stations; X2 and coverage-enhancement levels are LTE terms."""
+    text = " ".join(" ".join(retrieve_procedure(m).actions) for m in ANOMALY_SCENARIOS)
+    assert "X2" not in text and "CE level" not in text
 
 
 def test_unknown_mode_returns_none():

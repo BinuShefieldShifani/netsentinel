@@ -1,6 +1,6 @@
 """
-app.py — NetSentinel Streamlit Dashboard
-=========================================
+app.py - NetSentinel Streamlit dashboard
+========================================
 Run with:  streamlit run app.py
 
 Before first run:
@@ -8,14 +8,21 @@ Before first run:
   2. streamlit run app.py
 """
 
+import json
 import os
-import streamlit as st
-import pandas as pd
-import numpy as np
+
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
 
-from config import KPIS, ANOMALY_SCENARIOS, OLLAMA_MODEL
+from config import (
+    ANOMALY_SCORE_CRITICAL,
+    ANOMALY_SCORE_WARNING,
+    KPIS,
+    METRICS_PATH,
+    MODEL_PATH,
+    OLLAMA_MODEL,
+)
 from data_generator import generate_dataset
 
 st.set_page_config(
@@ -31,7 +38,7 @@ st.markdown("""
   <h1 style="margin:0;font-size:26px;">NetSentinel</h1>
   <p style="margin:0;color:gray;font-size:14px;">
     5G RAN Anomaly Detection & Self-Healing Agent ·
-    Isolation Forest + LangGraph · Targeting Ericsson O-RAN teams
+    Isolation Forest + LangGraph · synthetic 3GPP TS 28.552 KPIs
   </p>
 </div>
 """, unsafe_allow_html=True)
@@ -40,7 +47,7 @@ st.markdown("---")
 
 # ── Preflight ─────────────────────────────────────────────────────────────
 
-if not os.path.exists("models/isolation_forest.pkl"):
+if not os.path.exists(MODEL_PATH):
     st.error("Model not found. Run:  `python model_trainer.py`")
     st.stop()
 
@@ -71,16 +78,19 @@ with st.sidebar:
     run_btn = st.button("▶ Run Agent Analysis", type="primary", use_container_width=True)
 
     st.markdown("---")
-    st.markdown("### Model Benchmark")
-    st.markdown("""
-| Metric | Target | Meaning |
-|---|---|---|
-| Precision | > 0.80 | Low false alarms |
-| Recall | > 0.70 | Catches real faults |
-| F1 | > 0.75 | Balanced |
-
-*Isolation Forest, unsupervised*
-""")
+    st.markdown("### Model results (held-out days)")
+    if os.path.exists(METRICS_PATH):
+        with open(METRICS_PATH) as f:
+            m = json.load(f)
+        st.markdown(
+            f"| Metric | Value |\n|---|---|\n"
+            f"| Precision | {m['precision']:.3f} |\n| Recall | {m['recall']:.3f} |\n"
+            f"| F1 | {m['f1']:.3f} |\n| False alarms | {m['false_alarm_rate']:.2%} |"
+        )
+        st.caption("Synthetic data with large, single-reading faults. "
+                   "Scores this high mean the data is too easy, not that the model is.")
+    else:
+        st.caption("Run `python model_trainer.py` to compute metrics.")
 
 # ── Cell Data ─────────────────────────────────────────────────────────────
 
@@ -167,19 +177,14 @@ with tab1:
 
 with tab2:
     st.markdown("#### Anomaly Score Over Time")
-    st.markdown("Lower score = more anomalous. Dashed lines show Warning and Critical thresholds.")
-
-    from detecter import load_model_and_scaler
-    from data_generator import engineer_features, get_feature_columns
+    st.markdown("Below 0 = predicted anomaly. Dashed lines show Warning and Critical thresholds.")
 
     @st.cache_data
     def compute_scores(cell_id, n):
-        from detecter import load_model_and_scaler
-        from data_generator import KPI_FEATURES
+        from model_trainer import load_model_and_scaler, score_readings
         model, scaler = load_model_and_scaler()
         cdf    = df[df["cell_id"] == cell_id].sort_values("timestamp").tail(n).copy()
-        X      = scaler.transform(cdf[KPI_FEATURES].values)
-        scores = model.score_samples(X)
+        scores = score_readings(cdf, model, scaler)
         return cdf["timestamp"].tolist(), scores, cdf["is_anomaly"].values
 
     timestamps, scores, true_labels = compute_scores(cell_id, n_readings)
@@ -189,16 +194,16 @@ with tab2:
         x=timestamps, y=scores,
         mode="lines+markers",
         marker=dict(
-            color=["#E24B4A" if s <= -0.15 else "#EF9F27" if s <= -0.05 else "#1D9E75"
+            color=["#E24B4A" if s <= ANOMALY_SCORE_CRITICAL else "#EF9F27" if s < ANOMALY_SCORE_WARNING else "#1D9E75"
                    for s in scores],
             size=5,
         ),
         line=dict(color="rgba(100,100,100,0.3)", width=1),
         name="Anomaly Score",
     ))
-    fig_score.add_hline(y=-0.05, line_dash="dash", line_color="#EF9F27",
+    fig_score.add_hline(y=ANOMALY_SCORE_WARNING, line_dash="dash", line_color="#EF9F27",
                         annotation_text="Warning threshold")
-    fig_score.add_hline(y=-0.15, line_dash="dash", line_color="#E24B4A",
+    fig_score.add_hline(y=ANOMALY_SCORE_CRITICAL, line_dash="dash", line_color="#E24B4A",
                         annotation_text="Critical threshold")
 
     fig_score.update_layout(
@@ -293,7 +298,8 @@ with tab4:
                 st.markdown(f"**Plan ID:** `{plan.get('plan_id','—')}`")
                 st.markdown(f"**Cell:** {plan.get('cell_id','—')}")
                 st.markdown(f"**Failure Mode:** {plan.get('failure_mode','—')}")
-                st.markdown(f"**Confidence:** {plan.get('confidence','—')}")
+                st.markdown(f"**Confidence:** {plan.get('confidence','—')} "
+                            f"({plan.get('classification_source','—')})")
             with c2:
                 st.markdown(f"**Anomaly Score:** `{plan.get('anomaly_score','—')}`")
                 apply = plan.get("apply_immediately", False)
@@ -311,7 +317,7 @@ with tab4:
 
             params = plan.get("parameters_to_tune", [])
             if params:
-                st.markdown(f"**3GPP Parameters to tune:** `{'`, `'.join(params)}`")
+                st.markdown(f"**Parameters to tune:** `{'`, `'.join(params)}`")
 
             rationale = plan.get("technical_rationale", "")
             if rationale:
@@ -322,7 +328,6 @@ with tab4:
                 st.markdown(f"**Expected Outcome:** {outcome}")
 
             st.markdown("---")
-            import json
             st.download_button(
                 "⬇ Export Action Plan JSON",
                 data=json.dumps(plan, indent=2),

@@ -1,155 +1,162 @@
-# NetSentinel — 5G RAN Anomaly Detection & Self-Healing Agent
+# NetSentinel: 5G RAN anomaly detection with a guarded LLM agent
 
-**Autonomous multi-agent system for 5G O-RAN network operations.**  
-Isolation Forest · LangGraph · Local LLM · Streamlit · Python
+![CI](https://github.com/BinuShefieldShifani/netsentinel/actions/workflows/ci.yml/badge.svg)
 
-> Targets Ericsson Cognitive Software, Nokia SON teams, and telecom operators running O-RAN deployments.
+NetSentinel watches KPI readings from simulated 5G cells, detects when a cell
+starts misbehaving, works out the likely failure mode and proposes a
+remediation plan. An LLM helps with the diagnosis, but it never gets the last
+word on what happens to the network.
 
----
+Isolation Forest · LangGraph · Ollama · Streamlit · pytest · GitHub Actions
 
-## What It Does
-
-A 5G Radio Access Network generates millions of KPI measurements every minute.
-When a cell degrades — due to interference, hardware faults, capacity overload,
-or coverage issues — engineers need to diagnose and remediate within minutes to
-avoid dropped calls and SLA breaches.
-
-**NetSentinel monitors 50 simulated 5G cells in real time, detects anomalies,
-classifies the failure mode, and generates a 3GPP-parameter remediation plan autonomously.**
-
----
-
-## Agent Pipeline
+## Pipeline
 
 ```
-[KPI Monitor]              ← z-score analysis across 10 3GPP KPIs
-       ↓
-[Anomaly Scorer]           ← Isolation Forest anomaly score
-       ↓
-   (conditional)
-       ├── anomalous → [Root Cause Classifier]  ← LLM classifies failure mode
-       │                        ↓
-       │               [Remediation Planner]    ← LLM + 3GPP KB → action plan
-       │
-       └── normal    → [Routine Monitor]        ← monitoring summary
+[kpi_monitor]        robust z-score of the latest reading vs the cell's own history
+      |
+[anomaly_scorer]     Isolation Forest score of the latest reading
+      |
+  (router)
+      |-- anomalous -> [root_cause_classifier]   LLM, validated, with rule-based fallback
+      |                         |
+      |                [remediation_planner]     plan built in code, LLM writes text only
+      |
+      '-- normal    -> [routine_monitor]
 ```
 
-**What makes it agentic:** the confidence router — HIGH confidence + auto-applicable procedure → action plan flagged for immediate execution. LOW confidence or manual procedure required → escalates to human operator with full diagnostic. Different path, different outcome.
+## How the pipeline avoids trusting the LLM blindly
 
----
+The LLM is useful for explaining a fault in plain language. It is not trusted
+to make decisions about a live cell. Concretely:
 
-## KPIs Monitored (3GPP TS 28.552)
+1. **Its output is validated.** The failure mode must be one of five known
+   values and the confidence must be HIGH, MEDIUM or LOW. Bad JSON, an
+   invented failure mode, or an unreachable LLM all lead to the same place: a
+   rule-based classifier takes over and the confidence is set to LOW.
+2. **It can't touch the decision fields.** `apply_immediately`,
+   `escalate_to_human`, the actions and the parameters are always set by
+   code. The LLM may only fill in `technical_rationale` and
+   `expected_outcome`. There is a test where the LLM tries to switch on
+   auto-apply and replace the actions; both are ignored.
+3. **Auto-apply needs two conditions.** A plan is applied without a human
+   only if the confidence is HIGH *and* the procedure is marked
+   auto-applicable. Hardware faults are never auto-applicable, whatever the
+   LLM says. Everything else is escalated.
+4. **It works without the LLM.** With Ollama switched off, the pipeline still
+   detects, classifies and escalates. CI runs the whole suite this way.
 
-| KPI | Description | Unit | Anomaly Direction |
-|-----|-------------|------|-------------------|
-| RSRP | Reference Signal Received Power | dBm | Low = bad |
-| RSRQ | Reference Signal Received Quality | dB | Low = bad |
-| SINR | Signal to Interference+Noise Ratio | dB | Low = bad |
-| PRB DL | Downlink PRB Utilisation | % | High = bad |
-| PRB UL | Uplink PRB Utilisation | % | High = bad |
-| CQI | Channel Quality Indicator | — | Low = bad |
-| HO-SR | Handover Success Rate | % | Low = bad |
-| RLF Rate | Radio Link Failure Rate | % | High = bad |
-| TP DL | Downlink Throughput | Mbps | Low = bad |
-| TP UL | Uplink Throughput | Mbps | Low = bad |
+See `tests/test_pipeline.py` for the tests behind each point.
 
----
+## KPIs (3GPP TS 28.552)
 
-## Failure Scenarios Detected
+| KPI | Description | Unit | Bad when |
+|-----|-------------|------|----------|
+| RSRP | Reference Signal Received Power | dBm | low |
+| RSRQ | Reference Signal Received Quality | dB | low |
+| SINR | Signal to Interference + Noise Ratio | dB | low |
+| PRB DL / UL | PRB utilisation | % | high |
+| CQI | Channel Quality Indicator | | low |
+| HO-SR | Handover Success Rate | % | low |
+| RLF rate | Radio Link Failure rate | % | high |
+| TP DL / UL | Throughput | Mbps | low |
 
-| Scenario | Key KPI Signature |
-|----------|-------------------|
-| Interference | SINR ↓, RSRQ ↓, CQI ↓, RLF ↑ |
-| Capacity Overload | PRB DL/UL → 100%, TP ↓ |
-| Hardware Fault | RSRP ↓↓, all signal quality ↓ |
-| Coverage Gap | RSRP < -100 dBm, HO-SR ↓, RLF ↑ |
-| Handover Storm | HO-SR ↓↓, RLF ↑, PRB ↑ |
+Failure modes simulated: interference, capacity overload, hardware fault,
+coverage gap, handover storm.
 
----
+## Results, and why you shouldn't be impressed by them yet
 
-## Data
+The model is trained on the first 7 days and evaluated on the last 3 days of
+50 cells (`models/metrics.json`):
 
-Synthetic 5G RAN KPI dataset generated from 3GPP TS 28.552 distributions.
+| Metric | Held-out |
+|--------|----------|
+| Precision | 0.969 |
+| Recall | 1.000 |
+| F1 | 0.984 |
+| False alarm rate | 0.29% |
 
-| Property | Value |
-|----------|-------|
-| Cells | 50 (urban dense / urban / suburban / rural) |
-| Timestamps | 1,000 per cell (15-min intervals ≈ 10 days) |
-| Total rows | 50,000 |
-| Anomaly rate | 8% (realistic for live network) |
-| Generation | Fully reproducible — `python model_trainer.py` |
+These numbers say more about the data than the model. On the same dataset a
+single threshold, `rlf_rate > 2`, already reaches F1 0.89 with no ML at all.
+The reasons:
 
-Real operator KPI data is proprietary. Synthetic generation based on published
-3GPP KPI distributions is standard practice in O-RAN research
-(RANGAN, SpotLight, O-RAN SC xApp benchmarks).
+- injected faults are very large (RLF rate moves about 13 standard deviations)
+- each fault lasts exactly one 15-minute reading, while real faults build up
+  and persist
+- KPIs are generated independently, so in normal data SINR, CQI and
+  throughput don't move together the way they do in a real cell
 
----
+Making the simulation harder and more realistic is the next step (see
+Roadmap). Expect the scores to drop when that happens.
 
-## Model Performance
-
-| Metric | Result | Target |
-|--------|--------|--------|
-| Precision | > 0.80 | > 0.80 |
-| Recall | > 0.70 | > 0.70 |
-| F1 Score | > 0.75 | > 0.75 |
-
-Precision is prioritised over Recall: a false alarm (dispatching an engineer
-to a healthy cell) costs more than briefly missing a transient anomaly.
-
----
+With the LLM offline, the rule-based fallback picks the right failure mode in
+about 87% of held-out faults, and healthy cells are reported as NORMAL in
+about 97% of cases (the rest get a WARNING and go to a human).
 
 ## Setup
 
+Python 3.11 or newer.
+
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
 
-# 2. Generate data + train model (creates data/ and models/ folders)
-python model_trainer.py
-
-# 3. Launch dashboard
-streamlit run app.py
+python model_trainer.py      # generates data/ and trains models/
+streamlit run app.py         # dashboard
+pytest                       # 54 tests, no LLM needed
 ```
 
-**LLM backend (Ollama in Docker):**
+The LLM is optional. To use one, run Ollama and set:
+
 ```bash
-docker run -d --gpus all -p 11434:11434 ollama/ollama
-docker exec -it <container> ollama pull <your-model>
-# Set OLLAMA_HOST and OLLAMA_MODEL in config.py
+export OLLAMA_HOST=http://localhost:11434
+export OLLAMA_MODEL=gpt-oss:20b     # any chat model you have pulled
 ```
 
-The Isolation Forest anomaly detection works fully offline.
-Only root cause classification and remediation planning require the LLM.
+## Tests and CI
 
----
+`pytest` covers the data generator (ranges, reproducibility, fault
+signatures), the model (score scale, severity thresholds, held-out metrics),
+the knowledge base, and the agent pipeline end to end with a mocked LLM:
+offline, garbage output, invented failure modes, and an LLM that tries to
+override the plan.
 
-## Key Engineering Decisions
+Several tests are regression tests for bugs found when this repo was first
+reviewed: every healthy cell was reported CRITICAL (wrong score scale), every
+fault was classified as interference when the LLM was offline, and
+single-reading faults were averaged away by the KPI monitor.
 
-**Why Isolation Forest (not a supervised classifier)?**  
-Real O-RAN deployments rarely have clean anomaly labels. Isolation Forest is
-unsupervised — it learns the structure of normal operation and flags deviations.
-This matches how Ericsson's NOC tools actually work.
+GitHub Actions runs lint, tests and a training run on Python 3.11 and 3.12,
+and uploads the metrics file from each run.
 
-**Why synthetic data?**  
-5G operator KPI data is commercially sensitive and not publicly available.
-Synthetic generation from 3GPP-defined distributions is the approach used in
-published O-RAN research. The anomaly signatures are physically grounded —
-each scenario degrades the specific KPIs that would degrade in a real network.
+## Project layout
 
-**Why rolling features (3, 6, 12 readings)?**  
-A single noisy reading is uninformative. Sustained degradation over 90+ minutes
-is a real fault. Rolling mean and std capture the trend, not just the snapshot.
+```
+config.py            KPI definitions, thresholds, model settings
+data_generator.py    synthetic KPI simulation
+model_trainer.py     Isolation Forest training, scoring, held-out evaluation
+knowledge_base.py    remediation procedures per failure mode
+pipeline.py          LangGraph agent
+app.py               Streamlit dashboard
+tests/               pytest suite
+```
 
-**The conditional edge in LangGraph**  
-`apply_immediately: true` only when confidence is HIGH and the procedure is
-auto-applicable. Hardware faults always require a field engineer — the agent
-never auto-applies those. This is responsible AI design in a safety-critical domain.
+## Known limitations
 
----
+- Synthetic data only; see Results.
+- Remediation parameter names are illustrative, not from a specific vendor OSS.
+- Nothing is actually applied to a network. "Apply" means the plan is
+  marked for automatic execution.
+
+## Roadmap
+
+- More realistic simulation: correlated KPIs, faults that build up over
+  several readings, subtle degradations, time-split evaluation on that data
+- Measure LLM classification accuracy against the rule-based baseline
+- C++ scoring component (CMake, GoogleTest, pybind11)
+- Jenkins pipeline alongside GitHub Actions
 
 ## References
 
-- 3GPP TS 28.552 — 5G performance measurements
-- 3GPP TS 38.300 — NR overall description
-- RANGAN: GAN-empowered Anomaly Detection in 5G Cloud RAN (arXiv 2025)
-- O-RAN Alliance: O-RAN Use Cases and Deployment Scenarios
+- 3GPP TS 28.552, 5G performance measurements
+- 3GPP TS 38.300, NR overall description
+- O-RAN Alliance, use cases and deployment scenarios

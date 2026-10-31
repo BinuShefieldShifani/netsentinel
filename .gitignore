@@ -11,3 +11,7 @@ data/raw/
 models/*.pt
 models/*.pkl
 mlruns/
+data/
+models/
+.pytest_cache/
+.ruff_cache/

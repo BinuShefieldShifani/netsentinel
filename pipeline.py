@@ -1,443 +1,373 @@
 """
-agent_graph.py — NetSentinel LangGraph Agent Pipeline
-======================================================
+pipeline.py - NetSentinel LangGraph agent pipeline
+==================================================
 
-4 nodes, 1 conditional edge:
-
-  [kpi_monitor]
-       │
-  [anomaly_scorer]   ← Isolation Forest
-       │
+  [kpi_monitor]        robust z-score of the latest reading vs the cell's baseline
+       |
+  [anomaly_scorer]     Isolation Forest on the latest reading
+       |
    (router)
-       ├── anomalous → [root_cause_classifier]  ← LLM
-       │                        │
-       │               [remediation_planner]    ← LLM + KB
-       │
-       └── normal    → [routine_monitor]        ← LLM light summary
-                               │
-                             [END]
+       |-- anomalous -> [root_cause_classifier]  LLM, validated, rule-based fallback
+       |                        |
+       |               [remediation_planner]     plan built in code, LLM writes text only
+       |
+       '-- normal    -> [routine_monitor]
 
-What makes this agentic (not just ML + LLM):
-  - Conditional routing: the graph takes different paths based on anomaly score
-  - The remediation planner checks auto_applicable flag:
-    HIGH confidence + auto_applicable → applies fix to simulated config
-    LOW confidence or manual required → escalates with full diagnostic
-  - Each node has a specific tool/skill — no node does everything
+How the pipeline avoids trusting the LLM blindly:
+  - The LLM's failure mode and confidence are checked against a fixed set
+    of allowed values. Anything else (bad JSON, unknown mode, LLM offline)
+    falls back to a rule-based classifier with LOW confidence.
+  - The safety-relevant fields of the action plan (apply_immediately,
+    escalate_to_human, actions, parameters) are always set by code.
+    The LLM only fills in two free-text explanation fields.
+  - A plan is applied automatically only when confidence is HIGH and the
+    procedure is marked auto-applicable. Everything else goes to a human.
 """
 
 import json
 import re
-import numpy as np
-from typing import TypedDict, Optional
+import uuid
+from functools import lru_cache
+from typing import Optional, TypedDict
 
-import ollama
-from langgraph.graph import StateGraph, START, END
+import numpy as np
+from langgraph.graph import END, START, StateGraph
 
 from config import (
-    OLLAMA_HOST, OLLAMA_MODEL, KPIS,
-    ANOMALY_SCORE_CRITICAL, ANOMALY_SCORE_WARNING,
     ANOMALY_SCENARIOS,
+    KPIS,
+    LLM_TIMEOUT_S,
+    OLLAMA_HOST,
+    OLLAMA_MODEL,
+    ZSCORE_FLAG,
 )
-from detecter import load_model_and_scaler, score_cell_window
-from knowledge_base import retrieve_procedure, format_for_llm, PROCEDURES
+from knowledge_base import format_for_llm, retrieve_procedure
+from model_trainer import load_model_and_scaler, score_cell_window, severity_from_score
+
+VALID_CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
+UNCLASSIFIED = "unclassified"
 
 
 # ── State ─────────────────────────────────────────────────────────────────
 
 class AgentState(TypedDict):
-    # Input
-    cell_id:    str
-    cell_df:    object      # pandas DataFrame for this cell
+    cell_id: str
+    cell_df: object                 # pandas DataFrame, oldest -> newest
 
-    # KPI monitor outputs
-    kpi_snapshot:   dict    # latest KPI values
-    kpi_zscores:    dict    # z-score of each KPI
-    flagged_kpis:   list[str]
-    time_window:    str     # e.g. "last 12 readings (3 hours)"
+    kpi_snapshot: dict              # latest KPI values
+    kpi_zscores: dict               # robust z-score of the latest reading
+    flagged_kpis: list[str]
+    time_window: str
 
-    # Anomaly scorer outputs
-    anomaly_score:  float
-    is_anomalous:   bool
-    severity:       str     # CRITICAL / WARNING / NORMAL
+    anomaly_score: float
+    is_anomalous: bool
+    severity: str                   # CRITICAL / WARNING / NORMAL
 
-    # LLM outputs
-    failure_mode:       str
+    failure_mode: str
     failure_confidence: str
+    classification_source: str      # "llm" or "rules"
     root_cause_summary: str
-    procedure:          dict
-    action_plan:        dict
+    procedure: dict
+    action_plan: dict
 
-    # Trace
     reasoning_log: list[str]
 
 
-# ── Ollama ────────────────────────────────────────────────────────────────
+# ── Model and LLM access (patched in tests) ───────────────────────────────
 
-_client = ollama.Client(host=OLLAMA_HOST)
+@lru_cache(maxsize=1)
+def get_model():
+    return load_model_and_scaler()
 
 
-def call_llm(prompt: str, system: str = "") -> str:
+def call_llm(prompt: str, system: str = "") -> Optional[str]:
+    """Return the LLM reply, or None if the LLM is unavailable."""
     try:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
+        import ollama
+        client = ollama.Client(host=OLLAMA_HOST, timeout=LLM_TIMEOUT_S)
+        messages = [{"role": "system", "content": system}] if system else []
         messages.append({"role": "user", "content": prompt})
-        resp = _client.chat(
+        resp = client.chat(
             model=OLLAMA_MODEL,
             messages=messages,
             options={"temperature": 0.1, "num_predict": 500},
         )
         return resp["message"]["content"].strip()
-    except Exception as e:
-        return f"[LLM unavailable: {e}]"
-
-
-def parse_json(text: str) -> dict:
-    text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*", "", text)
-    text = text.strip()
-    try:
-        return json.loads(text)
     except Exception:
-        start, end = text.find("{"), text.rfind("}")
-        if start != -1 and end > start:
-            try:
-                return json.loads(text[start:end+1])
-            except Exception:
-                pass
-    return {"raw": text}
+        return None
 
 
-# ── Node 1: KPI Monitor (pure statistics) ─────────────────────────────────
+def parse_json(text: Optional[str]) -> Optional[dict]:
+    """Extract a JSON object from an LLM reply. None if there isn't one."""
+    if not text:
+        return None
+    text = re.sub(r"```(?:json)?", "", text).strip()
+    for candidate in (text, text[text.find("{"): text.rfind("}") + 1]):
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+# ── Node 1: KPI monitor ───────────────────────────────────────────────────
+
+def robust_zscores(df) -> tuple[dict, dict]:
+    """
+    z-score of the latest reading against all earlier readings of the cell.
+    Uses median and MAD so that past anomalies in the baseline don't
+    inflate the spread and hide the current one.
+    """
+    latest = df.iloc[-1]
+    baseline = df.iloc[:-1] if len(df) > 1 else df
+    snapshot, zscores = {}, {}
+    for kpi in KPIS:
+        values = baseline[kpi].astype(float).values
+        med = float(np.median(values))
+        mad = float(np.median(np.abs(values - med))) * 1.4826
+        spread = max(mad, 0.1 * KPIS[kpi][3], 1e-6)   # floor at 10% of nominal std
+        snapshot[kpi] = round(float(latest[kpi]), 3)
+        zscores[kpi] = round((float(latest[kpi]) - med) / spread, 2)
+    return snapshot, zscores
+
+
+def flag_kpis(zscores: dict) -> list[str]:
+    flagged = []
+    for kpi, z in zscores.items():
+        direction = KPIS[kpi][4]
+        if (direction == "low" and z < -ZSCORE_FLAG) or (direction == "high" and z > ZSCORE_FLAG):
+            flagged.append(kpi)
+    return flagged
+
 
 def kpi_monitor_node(state: AgentState) -> AgentState:
-    """
-    Analyses the cell's KPI time series.
-    Computes z-scores for each KPI over the last 12 readings (3 hours).
-    Flags KPIs that are > 2σ from their rolling baseline.
-    """
-    log = state.get("reasoning_log", [])
-    cell_id = state["cell_id"]
+    log = list(state.get("reasoning_log", []))
     df = state["cell_df"]
+    log.append(f"[KPI Monitor] Analysing cell {state['cell_id']}, {len(df)} readings")
 
-    log.append(f"[KPI Monitor] Analysing cell {cell_id} ...")
-    log.append(f"[KPI Monitor] {len(df)} readings available")
-
-    # Use last 50 readings for baseline, last 12 for current window
-    window = min(12, len(df))
-    baseline_df = df.iloc[:-window] if len(df) > window else df
-    current_df  = df.iloc[-window:]
-
-    kpi_snapshot = {}
-    kpi_zscores  = {}
-    flagged      = []
-
-    for kpi in KPIS:
-        if kpi not in df.columns:
-            continue
-        current_val = float(current_df[kpi].mean())
-        baseline_mean = float(baseline_df[kpi].mean()) if len(baseline_df) > 0 else current_val
-        baseline_std  = float(baseline_df[kpi].std())  if len(baseline_df) > 0 else 1.0
-        if baseline_std < 1e-6:
-            baseline_std = 1.0
-
-        z = (current_val - baseline_mean) / baseline_std
-        kpi_snapshot[kpi] = round(current_val, 3)
-        kpi_zscores[kpi]  = round(z, 2)
-
-        _, _, _, direction = KPIS[kpi][1], KPIS[kpi][2], KPIS[kpi][3], KPIS[kpi][4]
-        if (direction == "low" and z < -2.0) or (direction == "high" and z > 2.0):
-            flagged.append(kpi)
-
-    time_window = f"last {window} readings ({window*15} min)"
-    log.append(f"[KPI Monitor] Time window: {time_window}")
+    snapshot, zscores = robust_zscores(df)
+    flagged = flag_kpis(zscores)
+    time_window = f"latest reading vs previous {len(df) - 1} readings"
 
     if flagged:
-        log.append(f"[KPI Monitor] Flagged KPIs (|z| > 2σ): {', '.join(flagged)}")
+        log.append(f"[KPI Monitor] Flagged KPIs (> {ZSCORE_FLAG} sigma): {', '.join(flagged)}")
     else:
         log.append("[KPI Monitor] All KPIs within normal range")
 
-    return {
-        **state,
-        "kpi_snapshot":  kpi_snapshot,
-        "kpi_zscores":   kpi_zscores,
-        "flagged_kpis":  flagged,
-        "time_window":   time_window,
-        "reasoning_log": log,
-    }
+    return {**state, "kpi_snapshot": snapshot, "kpi_zscores": zscores,
+            "flagged_kpis": flagged, "time_window": time_window,
+            "reasoning_log": log}
 
 
-# ── Node 2: Anomaly Scorer (Isolation Forest) ─────────────────────────────
+# ── Node 2: Anomaly scorer ────────────────────────────────────────────────
 
 def anomaly_scorer_node(state: AgentState) -> AgentState:
-    """
-    Runs the trained Isolation Forest on the current cell window.
-    Assigns severity: CRITICAL / WARNING / NORMAL.
-    """
-    log = state["reasoning_log"]
-    log.append("[Anomaly Scorer] Loading Isolation Forest model ...")
+    log = list(state["reasoning_log"])
+    model, scaler = get_model()
+    score, model_says_anomaly = score_cell_window(state["cell_df"], model, scaler)
+    severity = severity_from_score(score)
+    is_anomalous = bool(model_says_anomaly or len(state["flagged_kpis"]) >= 2)
+    if is_anomalous and severity == "NORMAL":
+        severity = "WARNING"   # flagged by the KPI monitor even if the model is unsure
 
-    model, scaler = load_model_and_scaler()
-    score, is_anom = score_cell_window(state["cell_df"], model, scaler)
+    log.append(f"[Anomaly Scorer] Score: {score:.4f} | Model anomaly: {model_says_anomaly} "
+               f"| Severity: {severity}")
+    return {**state, "anomaly_score": score, "is_anomalous": is_anomalous,
+            "severity": severity, "reasoning_log": log}
 
-    if score <= ANOMALY_SCORE_CRITICAL:
-        severity = "CRITICAL"
-    elif score <= ANOMALY_SCORE_WARNING:
-        severity = "WARNING"
-    else:
-        severity = "NORMAL"
-
-    log.append(f"[Anomaly Scorer] Score: {score:.4f}  |  Anomalous: {bool(is_anom)}  |  Severity: {severity}")
-
-    return {
-        **state,
-        "anomaly_score": score,
-        "is_anomalous":  bool(is_anom or len(state["flagged_kpis"]) >= 2),
-        "severity":      severity,
-        "reasoning_log": log,
-    }
-
-
-# ── Router ────────────────────────────────────────────────────────────────
 
 def route_by_anomaly(state: AgentState) -> str:
-    if state["is_anomalous"] or state["severity"] in ("CRITICAL", "WARNING"):
-        return "root_cause_classifier"
-    return "routine_monitor"
+    return "root_cause_classifier" if state["is_anomalous"] else "routine_monitor"
 
 
-# ── Node 3a: Root Cause Classifier (LLM) ─────────────────────────────────
+# ── Node 3a: Root cause classifier ────────────────────────────────────────
+
+def rule_based_classify(z: dict) -> str:
+    """
+    Signature rules over the robust z-scores of the latest reading.
+    Used when the LLM is unavailable or returns something invalid.
+    """
+    if z["prb_dl"] > 2 and z["prb_ul"] > 2:
+        return "capacity_overload"
+    if z["rsrp"] < -2.5:
+        # both lose signal power; hardware faults also degrade RSRQ
+        return "hardware_fault" if z["rsrq"] < -1.5 else "coverage_gap"
+    if z["sinr"] < -2 and z["rsrq"] < -1.5:
+        return "interference"
+    if z["ho_sr"] < -2:
+        return "handover_storm"
+    return UNCLASSIFIED
+
+
+def validate_diagnosis(diagnosis: Optional[dict]) -> Optional[tuple[str, str, str]]:
+    """Return (mode, confidence, summary) if the LLM output is usable, else None."""
+    if not diagnosis:
+        return None
+    mode = str(diagnosis.get("failure_mode", "")).strip().lower()
+    conf = str(diagnosis.get("confidence", "")).strip().upper()
+    if mode not in ANOMALY_SCENARIOS or conf not in VALID_CONFIDENCE:
+        return None
+    return mode, conf, str(diagnosis.get("summary", ""))[:500]
+
 
 def root_cause_classifier_node(state: AgentState) -> AgentState:
-    """
-    LLM analyses the flagged KPI pattern and classifies the failure mode.
-    Outputs one of the 5 known O-RAN failure scenarios.
-    """
-    log = state["reasoning_log"]
-    log.append("[Root Cause Classifier] Calling LLM for failure mode classification ...")
-
-    snapshot  = state["kpi_snapshot"]
-    zscores   = state["kpi_zscores"]
-    flagged   = state["flagged_kpis"]
-    score     = state["anomaly_score"]
+    log = list(state["reasoning_log"])
+    snapshot, z, flagged = state["kpi_snapshot"], state["kpi_zscores"], state["flagged_kpis"]
 
     kpi_context = "\n".join(
-        f"  {kpi}: {snapshot.get(kpi,'?'):.3f} (z={zscores.get(kpi,0):.2f})"
-        + (" ← FLAGGED" if kpi in flagged else "")
-        for kpi in KPIS
+        f"  {k}: {snapshot[k]:.3f} (z={z[k]:.2f})" + (" <- FLAGGED" if k in flagged else "")
+        for k in KPIS
     )
-
-    failure_modes_list = "\n".join(
-        f"  {k}: {v}" for k, v in ANOMALY_SCENARIOS.items()
-    )
-
+    modes = "\n".join(f"  {k}: {v}" for k, v in ANOMALY_SCENARIOS.items())
     prompt = (
-        f"You are a 5G RAN expert. Classify the failure mode from these KPI readings.\n\n"
-        f"Cell: {state['cell_id']}  |  Anomaly score: {score:.4f}  |  "
-        f"Flagged KPIs: {', '.join(flagged) or 'none via z-score'}\n\n"
-        f"KPI READINGS:\n{kpi_context}\n\n"
-        f"POSSIBLE FAILURE MODES:\n{failure_modes_list}\n\n"
-        f"Respond with JSON only:\n"
-        f'{{"failure_mode": "<one of the keys above>", '
-        f'"confidence": "<HIGH|MEDIUM|LOW>", '
-        f'"primary_indicators": ["<kpi> is <observation>"], '
-        f'"summary": "<2 sentence technical explanation>"}}'
+        "Classify the failure mode of this 5G cell from its KPI readings.\n\n"
+        f"Cell: {state['cell_id']} | Anomaly score: {state['anomaly_score']:.4f} | "
+        f"Flagged KPIs: {', '.join(flagged) or 'none'}\n\n"
+        f"KPI READINGS:\n{kpi_context}\n\nPOSSIBLE FAILURE MODES:\n{modes}\n\n"
+        "Respond with JSON only:\n"
+        '{"failure_mode": "<one of the keys above>", "confidence": "<HIGH|MEDIUM|LOW>", '
+        '"summary": "<2 sentence technical explanation>"}'
     )
 
-    response  = call_llm(prompt, system="You are an expert 5G network engineer. Return only JSON.")
-    diagnosis = parse_json(response)
+    log.append("[Root Cause Classifier] Asking LLM for failure mode ...")
+    result = validate_diagnosis(parse_json(call_llm(prompt, system="You are a 5G RAN engineer. Return only JSON.")))
 
-    failure_mode = diagnosis.get("failure_mode", "interference")
-    confidence   = diagnosis.get("confidence", "MEDIUM")
-    summary      = diagnosis.get("summary", "")
+    if result:
+        mode, confidence, summary = result
+        source = "llm"
+    else:
+        mode = rule_based_classify(z)
+        confidence, summary, source = "LOW", "", "rules"
+        log.append("[Root Cause Classifier] LLM unavailable or output invalid, using rule-based fallback")
 
-    # Fallback if LLM returns unknown mode
-    if failure_mode not in ANOMALY_SCENARIOS:
-        failure_mode = _heuristic_classify(flagged, snapshot)
-        confidence   = "MEDIUM"
+    log.append(f"[Root Cause Classifier] Mode: {mode} | Confidence: {confidence} | Source: {source}")
 
-    log.append(f"[Root Cause Classifier] Mode: {failure_mode}  |  Confidence: {confidence}")
-    if summary:
-        log.append(f"[Root Cause Classifier] {summary}")
-
-    proc = retrieve_procedure(failure_mode)
-    log.append(f"[Root Cause Classifier] Procedure retrieved: {proc.id if proc else 'none'}")
-
-    return {
-        **state,
-        "failure_mode":       failure_mode,
-        "failure_confidence": confidence,
-        "root_cause_summary": summary,
-        "procedure":          {
-            "id":            proc.id if proc else "N/A",
-            "title":         proc.title if proc else "Manual investigation required",
-            "auto_applicable": proc.auto_applicable if proc else False,
-            "severity":      proc.severity if proc else "HIGH",
-            "actions":       proc.actions if proc else [],
-            "parameters":    proc.parameters if proc else [],
-        } if proc else {},
-        "reasoning_log": log,
+    proc = retrieve_procedure(mode)
+    procedure = {
+        "id": proc.id, "title": proc.title, "auto_applicable": proc.auto_applicable,
+        "severity": proc.severity, "actions": proc.actions, "parameters": proc.parameters,
+    } if proc else {
+        "id": "N/A", "title": "Manual investigation required", "auto_applicable": False,
+        "severity": "HIGH", "actions": ["Escalate to RAN engineer for manual diagnosis."],
+        "parameters": [],
     }
+    log.append(f"[Root Cause Classifier] Procedure: {procedure['id']}")
+
+    return {**state, "failure_mode": mode, "failure_confidence": confidence,
+            "classification_source": source, "root_cause_summary": summary,
+            "procedure": procedure, "reasoning_log": log}
 
 
-def _heuristic_classify(flagged: list, snapshot: dict) -> str:
-    """Rule-based fallback classification when LLM is unavailable."""
-    if "sinr" in flagged and "rsrq" in flagged:
-        return "interference"
-    if "prb_dl" in flagged or "prb_ul" in flagged:
-        return "capacity_overload"
-    if "rsrp" in flagged and snapshot.get("rsrp", -75) < -100:
-        return "coverage_gap"
-    if "ho_sr" in flagged or "rlf_rate" in flagged:
-        return "handover_storm"
-    return "hardware_fault"
-
-
-# ── Node 3b: Routine Monitor (LLM light) ─────────────────────────────────
+# ── Node 3b: Routine monitor ──────────────────────────────────────────────
 
 def routine_monitor_node(state: AgentState) -> AgentState:
-    """Healthy cell — generate a brief monitoring summary."""
-    log = state["reasoning_log"]
-    log.append("[Routine Monitor] Cell is healthy — generating monitoring summary ...")
-
-    best_kpi  = min(state["kpi_zscores"], key=lambda k: abs(state["kpi_zscores"][k]))
+    log = list(state["reasoning_log"])
+    log.append("[Routine Monitor] Cell is healthy, no action needed")
     watch_kpi = max(state["kpi_zscores"], key=lambda k: abs(state["kpi_zscores"][k]))
-
     return {
         **state,
-        "failure_mode":       "none",
-        "failure_confidence": "HIGH",
+        "failure_mode": "none", "failure_confidence": "HIGH",
+        "classification_source": "rules",
         "root_cause_summary": "Cell operating within normal parameters.",
         "procedure": {},
         "action_plan": {
-            "type":             "MONITORING",
-            "cell_id":          state["cell_id"],
-            "anomaly_score":    round(state["anomaly_score"], 4),
-            "severity":         "NORMAL",
-            "recommendation":   "Continue scheduled monitoring. No action required.",
-            "watch_kpi":        watch_kpi,
-            "next_check_in":    "15 minutes",
+            "type": "MONITORING", "cell_id": state["cell_id"],
+            "failure_mode": "none", "confidence": "HIGH", "classification_source": "rules",
+            "apply_immediately": False, "escalate_to_human": False,
+            "anomaly_score": round(state["anomaly_score"], 4), "severity": "NORMAL",
+            "recommendation": "Continue scheduled monitoring. No action required.",
+            "watch_kpi": watch_kpi, "next_check_in": "15 minutes",
         },
         "reasoning_log": log,
     }
 
 
-# ── Node 4: Remediation Planner (LLM) ────────────────────────────────────
+# ── Node 4: Remediation planner ───────────────────────────────────────────
+
+def build_action_plan(state: AgentState) -> dict:
+    """All decision fields come from code, never from the LLM."""
+    proc = state["procedure"]
+    apply_now = state["failure_confidence"] == "HIGH" and bool(proc.get("auto_applicable"))
+    return {
+        "plan_id": f"ACT-{state['cell_id']}-{uuid.uuid4().hex[:8]}",
+        "cell_id": state["cell_id"],
+        "severity": state["severity"],
+        "failure_mode": state["failure_mode"],
+        "confidence": state["failure_confidence"],
+        "classification_source": state["classification_source"],
+        "apply_immediately": apply_now,
+        "escalate_to_human": not apply_now,
+        "anomaly_score": round(state["anomaly_score"], 4),
+        "actions": list(proc.get("actions", []))[:4],
+        "parameters_to_tune": list(proc.get("parameters", [])),
+        "technical_rationale": (
+            f"Cell {state['cell_id']} matches the {state['failure_mode']} pattern "
+            f"(anomaly score {state['anomaly_score']:.4f}). "
+            f"Flagged KPIs: {', '.join(state['flagged_kpis']) or 'none'}."
+        ),
+        "expected_outcome": "",
+    }
+
 
 def remediation_planner_node(state: AgentState) -> AgentState:
-    """
-    Generates the final action plan.
-    HIGH confidence + auto_applicable → includes "apply_immediately: true"
-    LOW confidence or manual proc     → escalates to human operator
-    """
-    log = state["reasoning_log"]
-    log.append("[Remediation Planner] Generating action plan ...")
-
-    proc       = state.get("procedure", {})
-    confidence = state["failure_confidence"]
-    auto_ok    = proc.get("auto_applicable", False)
-    apply_now  = (confidence == "HIGH" and auto_ok)
+    log = list(state["reasoning_log"])
+    plan = build_action_plan(state)
 
     proc_obj = retrieve_procedure(state["failure_mode"])
-    proc_context = format_for_llm(proc_obj) if proc_obj else "No specific procedure found."
+    if proc_obj:
+        plan["expected_outcome"] = proc_obj.expected_improvement
 
-    import random
-    plan_id = f"ACT-{state['cell_id']}-{random.randint(10000,99999)}"
-
+    # The LLM may only improve the two explanation fields.
     prompt = (
-        f"Fill in the two <FILL> fields in this action plan JSON. Return JSON only.\n\n"
-        f'{{\n'
-        f'  "plan_id": "{plan_id}",\n'
-        f'  "cell_id": "{state["cell_id"]}",\n'
-        f'  "severity": "{state["severity"]}",\n'
-        f'  "failure_mode": "{state["failure_mode"]}",\n'
-        f'  "confidence": "{confidence}",\n'
-        f'  "apply_immediately": {str(apply_now).lower()},\n'
-        f'  "anomaly_score": {state["anomaly_score"]:.4f},\n'
-        f'  "actions": {json.dumps(proc.get("actions", [])[:4])},\n'
-        f'  "parameters_to_tune": {json.dumps(proc.get("parameters", []))},\n'
-        f'  "escalate_to_human": {str(not auto_ok).lower()},\n'
-        f'  "technical_rationale": <FILL: one sentence explaining the root cause>,\n'
-        f'  "expected_outcome": <FILL: one sentence on expected improvement>\n'
-        f'}}\n\n'
-        f"Context:\n"
-        f"Flagged KPIs: {', '.join(state['flagged_kpis'])}\n"
-        f"Procedure: {proc_context[:400]}"
+        "Write two short sentences for a RAN engineer. Return JSON only: "
+        '{"technical_rationale": "...", "expected_outcome": "..."}\n\n'
+        f"Failure mode: {state['failure_mode']}\n"
+        f"Flagged KPIs: {', '.join(state['flagged_kpis']) or 'none'}\n"
+        f"Procedure:\n{format_for_llm(proc_obj)[:400] if proc_obj else 'none'}"
     )
+    text = parse_json(call_llm(prompt, system="You are a 5G RAN engineer. Return only JSON."))
+    if text:
+        for field in ("technical_rationale", "expected_outcome"):
+            value = text.get(field)
+            if isinstance(value, str) and value.strip():
+                plan[field] = value.strip()[:500]
 
-    response  = call_llm(prompt, system="You are a 5G network engineer. Return only the completed JSON.")
-    plan      = parse_json(response)
-
-    if "raw" in plan:
-        plan = {
-            "plan_id":             plan_id,
-            "cell_id":             state["cell_id"],
-            "severity":            state["severity"],
-            "failure_mode":        state["failure_mode"],
-            "confidence":          confidence,
-            "apply_immediately":   apply_now,
-            "anomaly_score":       round(state["anomaly_score"], 4),
-            "actions":             proc.get("actions", [])[:4],
-            "parameters_to_tune":  proc.get("parameters", []),
-            "escalate_to_human":   not auto_ok,
-            "technical_rationale": (
-                f"Cell {state['cell_id']} shows {state['failure_mode']} pattern "
-                f"with anomaly score {state['anomaly_score']:.4f}. "
-                f"Flagged KPIs: {', '.join(state['flagged_kpis'])}."
-            ),
-            "expected_outcome": proc_obj.expected_improvement if proc_obj else "Improvement expected after parameter adjustment.",
-        }
-
-    log.append(f"[Remediation Planner] Plan: {plan.get('plan_id')}")
-    log.append(f"[Remediation Planner] Apply immediately: {apply_now}  |  Escalate: {not auto_ok}")
-
+    log.append(f"[Remediation Planner] Plan {plan['plan_id']} | Apply immediately: "
+               f"{plan['apply_immediately']} | Escalate: {plan['escalate_to_human']}")
     return {**state, "action_plan": plan, "reasoning_log": log}
 
 
-# ── Build Graph ───────────────────────────────────────────────────────────
+# ── Graph ─────────────────────────────────────────────────────────────────
 
 def build_graph():
     g = StateGraph(AgentState)
-    g.add_node("kpi_monitor",           kpi_monitor_node)
-    g.add_node("anomaly_scorer",         anomaly_scorer_node)
-    g.add_node("root_cause_classifier",  root_cause_classifier_node)
-    g.add_node("routine_monitor",        routine_monitor_node)
-    g.add_node("remediation_planner",    remediation_planner_node)
+    g.add_node("kpi_monitor", kpi_monitor_node)
+    g.add_node("anomaly_scorer", anomaly_scorer_node)
+    g.add_node("root_cause_classifier", root_cause_classifier_node)
+    g.add_node("routine_monitor", routine_monitor_node)
+    g.add_node("remediation_planner", remediation_planner_node)
 
     g.add_edge(START, "kpi_monitor")
     g.add_edge("kpi_monitor", "anomaly_scorer")
-
-    g.add_conditional_edges(
-        "anomaly_scorer",
-        route_by_anomaly,
-        {
-            "root_cause_classifier": "root_cause_classifier",
-            "routine_monitor":       "routine_monitor",
-        }
-    )
+    g.add_conditional_edges("anomaly_scorer", route_by_anomaly, {
+        "root_cause_classifier": "root_cause_classifier",
+        "routine_monitor": "routine_monitor",
+    })
     g.add_edge("root_cause_classifier", "remediation_planner")
-    g.add_edge("remediation_planner",   END)
-    g.add_edge("routine_monitor",       END)
-
+    g.add_edge("remediation_planner", END)
+    g.add_edge("routine_monitor", END)
     return g.compile()
 
 
 def run_analysis(cell_id: str, cell_df) -> AgentState:
-    graph = build_graph()
-    return graph.invoke({
-        "cell_id":          cell_id,
-        "cell_df":          cell_df,
-        "kpi_snapshot":     {},
-        "kpi_zscores":      {},
-        "flagged_kpis":     [],
-        "time_window":      "",
-        "anomaly_score":    0.0,
-        "is_anomalous":     False,
-        "severity":         "NORMAL",
-        "failure_mode":     "",
-        "failure_confidence": "",
-        "root_cause_summary": "",
-        "procedure":        {},
-        "action_plan":      {},
-        "reasoning_log":    [],
+    df = cell_df.sort_values("timestamp").reset_index(drop=True)
+    return build_graph().invoke({
+        "cell_id": cell_id, "cell_df": df,
+        "kpi_snapshot": {}, "kpi_zscores": {}, "flagged_kpis": [], "time_window": "",
+        "anomaly_score": 0.0, "is_anomalous": False, "severity": "NORMAL",
+        "failure_mode": "", "failure_confidence": "", "classification_source": "",
+        "root_cause_summary": "", "procedure": {}, "action_plan": {},
+        "reasoning_log": [],
     })

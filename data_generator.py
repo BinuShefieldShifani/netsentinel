@@ -1,11 +1,14 @@
 """
-data_generator.py — Synthetic 5G RAN KPI Data Generator
-=========================================================
+data_generator.py - Synthetic 5G RAN KPI data generator
+=======================================================
 Why synthetic data?
-  Real 5G operator KPI data is proprietary — no public dataset exists with
-  the full KPI set needed for RAN anomaly detection. Synthetic generation
-  based on 3GPP TS 28.552 distributions is standard practice in O-RAN
-  research (see: RANGAN, SpotLight, O-RAN SC xApp benchmarks).
+  Operator KPI data is commercially sensitive and not publicly available
+  with the full KPI set used here, so the KPIs are simulated using the
+  3GPP TS 28.552 definitions and plausible nominal ranges.
+
+Known limitation (current version):
+  KPIs are drawn independently and each fault lasts a single reading,
+  so faults are much easier to spot than in a live network.
 
 What we simulate:
   50 cells × 1000 timestamps = 50,000 rows
@@ -17,37 +20,24 @@ to make the dataset realistic — not all cells have the same nominal values.
 """
 
 import os
-import numpy as np
-import pandas as pd
 from datetime import datetime, timedelta
 
-from config import (
-    KPIS, ANOMALY_SCENARIOS, N_CELLS, N_TIMESTAMPS,
-    ANOMALY_RATE, RANDOM_SEED, DATA_DIR, DATA_FILE
-)
+import numpy as np
+import pandas as pd
+
+from config import ANOMALY_RATE, ANOMALY_SCENARIOS, DATA_FILE, KPIS, N_CELLS, N_TIMESTAMPS, RANDOM_SEED
 
 
-def generate_dataset(force: bool = False) -> pd.DataFrame:
-    """
-    Generate or load the RAN KPI dataset.
-    If the CSV already exists, loads it instead of regenerating.
-    """
-    if os.path.exists(DATA_FILE) and not force:
-        print(f"Loading existing dataset from {DATA_FILE} ...")
-        df = pd.read_csv(DATA_FILE)
-        print(f"  {len(df):,} rows, {df['cell_id'].nunique()} cells loaded.")
-        return df
-
-    print("Generating synthetic 5G RAN KPI dataset ...")
-    print(f"  {N_CELLS} cells × {N_TIMESTAMPS} timestamps = {N_CELLS*N_TIMESTAMPS:,} rows")
-
-    rng = np.random.default_rng(RANDOM_SEED)
+def simulate(n_cells: int = N_CELLS, n_timestamps: int = N_TIMESTAMPS,
+             anomaly_rate: float = ANOMALY_RATE, seed: int = RANDOM_SEED) -> pd.DataFrame:
+    """Simulate the KPI dataset in memory. Pure function, no file I/O."""
+    rng = np.random.default_rng(seed)
     rows = []
 
     # Cell type distribution (affects baseline KPI values)
     cell_types = rng.choice(
         ["urban_dense", "urban", "suburban", "rural"],
-        size=N_CELLS,
+        size=n_cells,
         p=[0.2, 0.4, 0.3, 0.1]
     )
 
@@ -61,14 +51,14 @@ def generate_dataset(force: bool = False) -> pd.DataFrame:
 
     start_time = datetime(2024, 1, 1, 0, 0, 0)
 
-    for cell_idx in range(N_CELLS):
+    for cell_idx in range(n_cells):
         cell_id   = f"CELL_{cell_idx+1:04d}"
         cell_type = cell_types[cell_idx]
         offsets   = cell_offsets[cell_type]
 
-        for t in range(N_TIMESTAMPS):
+        for t in range(n_timestamps):
             timestamp  = start_time + timedelta(minutes=15 * t)
-            is_anomaly = rng.random() < ANOMALY_RATE
+            is_anomaly = rng.random() < anomaly_rate
             scenario   = None
 
             if is_anomaly:
@@ -80,11 +70,26 @@ def generate_dataset(force: bool = False) -> pd.DataFrame:
             )
             rows.append(row)
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
-    os.makedirs(DATA_DIR, exist_ok=True)
-    df.to_csv(DATA_FILE, index=False)
-    print(f"  Saved to {DATA_FILE}")
+
+def generate_dataset(force: bool = False, path: str = DATA_FILE) -> pd.DataFrame:
+    """
+    Load the dataset from disk, or simulate and save it if it does not exist.
+    """
+    if os.path.exists(path) and not force:
+        print(f"Loading existing dataset from {path} ...")
+        df = pd.read_csv(path)
+        print(f"  {len(df):,} rows, {df['cell_id'].nunique()} cells loaded.")
+        return df
+
+    print("Generating synthetic 5G RAN KPI dataset ...")
+    print(f"  {N_CELLS} cells x {N_TIMESTAMPS} timestamps = {N_CELLS*N_TIMESTAMPS:,} rows")
+    df = simulate()
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"  Saved to {path}")
     print(f"  Anomaly rate: {df['is_anomaly'].mean()*100:.1f}%")
     print(f"  Scenarios: {df[df['is_anomaly'] == 1]['scenario'].value_counts().to_dict()}")
     return df
@@ -129,7 +134,7 @@ def _generate_row(rng, cell_id, cell_type, timestamp, offsets,
         "timestamp": timestamp.isoformat(),
         **{k: round(v, 3) for k, v in vals.items()},
         "is_anomaly": int(is_anomaly),
-        "scenario":   scenario or "normal",
+        "scenario":   str(scenario) if scenario else "normal",
     }
 
 
@@ -185,7 +190,7 @@ def _inject_anomaly(rng, vals: dict, scenario: str) -> dict:
     return vals
 
 
-# ── Feature engineering ───────────────────────────────────────────────────
+# ── Feature engineering (not used by the current model, kept for step 3) ─
 
 KPI_FEATURES = list(KPIS.keys())
 ROLLING_WINDOWS = [3, 6, 12]   # 15-min intervals → 45min, 90min, 3hr

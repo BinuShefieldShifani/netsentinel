@@ -1,11 +1,11 @@
 """
-knowledge_base.py — 5G RAN Troubleshooting Knowledge Base
-===========================================================
-Maps failure modes → specific 3GPP parameter remediation actions.
-In production this would be Ericsson's OSS/ENM runbook database.
+knowledge_base.py - 5G RAN troubleshooting knowledge base
+=========================================================
+Maps each failure mode to a remediation procedure. In a real deployment
+this would come from the operator's OSS runbooks. Parameter names here are
+illustrative, not taken from any specific vendor's OSS.
 
-References: Ericsson RAN Cognitive Software documentation,
-3GPP TS 38.300 (NR overall description), TS 36.423 (X2 interface).
+References: 3GPP TS 38.300 (NR overall description), TS 36.423 (X2 interface).
 """
 
 from dataclasses import dataclass
@@ -18,7 +18,7 @@ class RemediationProcedure:
     title:           str
     severity:        str          # CRITICAL / HIGH / MEDIUM
     auto_applicable: bool         # can be applied without human approval
-    parameters:      list[str]    # 3GPP/Ericsson OSS parameter names to tune
+    parameters:      list[str]    # illustrative OSS parameter names to tune
     actions:         list[str]
     expected_improvement: str
 
@@ -126,7 +126,7 @@ def format_for_llm(proc: RemediationProcedure) -> str:
     return (
         f"Procedure {proc.id}: {proc.title}\n"
         f"Severity: {proc.severity} | Auto-applicable: {proc.auto_applicable}\n"
-        f"3GPP Parameters: {params_text}\n"
+        f"Parameters: {params_text}\n"
         f"Actions:\n{actions_text}\n"
         f"Expected improvement: {proc.expected_improvement}"
     )

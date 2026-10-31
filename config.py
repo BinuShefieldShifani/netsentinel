@@ -1,72 +1,73 @@
 """
-config.py — NetSentinel Central Configuration
-===============================================
-Targets: Ericsson (RAN Cognitive Software team), Nokia, Telenor Sweden
-Domain:  5G O-RAN autonomous network operations
-
-KPI definitions follow 3GPP TS 28.552 (Management and orchestration;
-5G performance measurements) — the standard Ericsson engineers work with.
+config.py - NetSentinel central configuration
+=============================================
+KPI definitions follow 3GPP TS 28.552 (5G performance measurements).
+LLM settings can be overridden with environment variables so the same
+code runs locally, in CI (no LLM) and against a remote Ollama host.
 """
 
-# ── LLM (Ollama in Docker) ────────────────────────────────────────────────
-OLLAMA_HOST  = "http://localhost:11434"
-OLLAMA_MODEL = "gptoss:20b"
+import os
 
-# ── Data ──────────────────────────────────────────────────────────────────
-DATA_DIR       = "data"
-DATA_FILE      = "data/ran_kpi_dataset.csv"
-MODEL_PATH     = "models/isolation_forest.pkl"
-SCALER_PATH    = "models/scaler.pkl"
+# ── LLM (Ollama) ──────────────────────────────────────────────────────────
+OLLAMA_HOST    = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+LLM_TIMEOUT_S  = float(os.getenv("NETSENTINEL_LLM_TIMEOUT", "60"))
 
-# ── KPI Definitions (3GPP TS 28.552) ─────────────────────────────────────
-# Each KPI: (description, unit, nominal_mean, nominal_std, anomaly_direction)
+# ── Paths ─────────────────────────────────────────────────────────────────
+DATA_DIR     = "data"
+DATA_FILE    = "data/ran_kpi_dataset.csv"
+MODEL_PATH   = "models/isolation_forest.pkl"
+SCALER_PATH  = "models/scaler.pkl"
+METRICS_PATH = "models/metrics.json"
+
+# ── KPI definitions (3GPP TS 28.552) ──────────────────────────────────────
+# kpi: (description, unit, nominal_mean, nominal_std, anomaly_direction)
 # anomaly_direction: "high" = high values are bad, "low" = low values are bad
-
 KPIS = {
-    "rsrp":    ("Reference Signal Received Power",  "dBm",  -75.0,  8.0, "low"),
-    "rsrq":    ("Reference Signal Received Quality","dB",   -8.0,   3.0, "low"),
-    "sinr":    ("Signal to Interference+Noise Ratio","dB",   15.0,  5.0, "low"),
-    "prb_dl":  ("Downlink PRB Utilisation",         "%",    45.0,  15.0, "high"),
-    "prb_ul":  ("Uplink PRB Utilisation",           "%",    35.0,  12.0, "high"),
-    "cqi":     ("Channel Quality Indicator",        "",     9.0,   2.0,  "low"),
-    "ho_sr":   ("Handover Success Rate",            "%",    98.5,  1.0,  "low"),
-    "rlf_rate":("Radio Link Failure Rate",          "%",    0.5,   0.3,  "high"),
-    "tp_dl":   ("Downlink Throughput",              "Mbps", 150.0, 40.0, "low"),
-    "tp_ul":   ("Uplink Throughput",                "Mbps", 50.0,  15.0, "low"),
+    "rsrp":     ("Reference Signal Received Power",    "dBm",  -75.0,  8.0, "low"),
+    "rsrq":     ("Reference Signal Received Quality",  "dB",    -8.0,  3.0, "low"),
+    "sinr":     ("Signal to Interference+Noise Ratio", "dB",    15.0,  5.0, "low"),
+    "prb_dl":   ("Downlink PRB Utilisation",           "%",     45.0, 15.0, "high"),
+    "prb_ul":   ("Uplink PRB Utilisation",             "%",     35.0, 12.0, "high"),
+    "cqi":      ("Channel Quality Indicator",          "",       9.0,  2.0, "low"),
+    "ho_sr":    ("Handover Success Rate",              "%",     98.5,  1.0, "low"),
+    "rlf_rate": ("Radio Link Failure Rate",            "%",      0.5,  0.3, "high"),
+    "tp_dl":    ("Downlink Throughput",                "Mbps", 150.0, 40.0, "low"),
+    "tp_ul":    ("Uplink Throughput",                  "Mbps",  50.0, 15.0, "low"),
 }
 
-# ── Anomaly Scenarios (injected during data generation) ──────────────────
-# These map to real failure modes Ericsson's NOC teams deal with daily
+# ── Failure scenarios injected during data generation ─────────────────────
 ANOMALY_SCENARIOS = {
     "interference":      "High interference from neighbouring cell or external source",
-    "capacity_overload": "Cell capacity overload — too many active UEs",
-    "hardware_fault":    "Hardware degradation — antenna or baseband unit issue",
-    "coverage_gap":      "Coverage hole — UEs at cell edge with weak signal",
-    "handover_storm":    "Handover ping-pong — excessive unnecessary handovers",
+    "capacity_overload": "Cell capacity overload, too many active UEs",
+    "hardware_fault":    "Hardware degradation, antenna or baseband unit issue",
+    "coverage_gap":      "Coverage hole, UEs at cell edge with weak signal",
+    "handover_storm":    "Handover ping-pong, excessive unnecessary handovers",
 }
 
-# ── Alert Thresholds ──────────────────────────────────────────────────────
-# Anomaly score from Isolation Forest: higher (closer to 0) = more anomalous
-# IsolationForest score range: -1 (anomaly) to ~0.5 (normal)
-ANOMALY_SCORE_CRITICAL = -0.15   # definitely anomalous
-ANOMALY_SCORE_WARNING  = -0.05   # borderline
+# ── Severity thresholds ───────────────────────────────────────────────────
+# Applied to IsolationForest.decision_function() on the LATEST reading.
+# decision_function < 0 means the model predicts an anomaly.
+# Normal readings sit around +0.1, injected faults around -0.08.
+ANOMALY_SCORE_WARNING  = 0.0     # predicted anomalous
+ANOMALY_SCORE_CRITICAL = -0.05   # clearly anomalous
+
+# ── KPI monitor ───────────────────────────────────────────────────────────
+ZSCORE_FLAG = 2.0          # flag a KPI when the latest reading is > 2 sigma off baseline
 
 # ── Simulation ────────────────────────────────────────────────────────────
-N_CELLS          = 50     # number of simulated 5G cells
-N_TIMESTAMPS     = 1000   # time steps per cell (15-min intervals → ~10 days)
-ANOMALY_RATE     = 0.08   # 8% of readings are anomalous (realistic for live network)
-RANDOM_SEED      = 42
+N_CELLS      = 50      # simulated cells
+N_TIMESTAMPS = 1000    # readings per cell (15-min intervals, about 10 days)
+ANOMALY_RATE = 0.08
+RANDOM_SEED  = 42
 
 # ── Model ─────────────────────────────────────────────────────────────────
-# Isolation Forest hyperparameters tuned for RAN KPI data
-IF_CONTAMINATION = 0.08   # matches ANOMALY_RATE above
-IF_N_ESTIMATORS  = 200
-IF_MAX_SAMPLES   = "auto"
+IF_CONTAMINATION = 0.08
+IF_N_ESTIMATORS  = 300
+IF_MAX_SAMPLES   = 256
+IF_MAX_FEATURES  = 0.7
+TRAIN_SPLIT_DAYS = 7     # train on the first 7 days, evaluate on the rest
 
-# ── What counts as a good result ─────────────────────────────────────────
-# On synthetic data with known anomaly labels:
-# F1 > 0.75 → Good    (typical for unsupervised on network data)
-# F1 > 0.85 → Excellent
-# Precision > 0.80 → important: low false alarm rate matters for NOC teams
 PRECISION_TARGET = 0.80
+RECALL_TARGET    = 0.70
 F1_TARGET        = 0.75

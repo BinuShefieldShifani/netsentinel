@@ -16,3 +16,6 @@ models/
 .pytest_cache/
 .ruff_cache/
 reports/*.json
+build/
+*.so
+*.pyd

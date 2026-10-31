@@ -18,8 +18,14 @@ on validation days 8-10 against raw-only, residual-only and per-cell-scaled
 variants (see experiments/select_features.py).
 
 Only past readings are used, so the features can be computed live.
+
+The baseline has two implementations that must give identical results:
+  cpp/       C++17, used automatically if the _netsentinel_cpp module is built
+  python     seasonal_baseline_python() below, the reference
+Set NETSENTINEL_FEATURES=python to force the Python version.
 """
 
+import os
 import warnings
 
 import numpy as np
@@ -27,15 +33,42 @@ import pandas as pd
 
 from config import BASELINE_DAYS, FALLBACK_WINDOW, KPIS, READINGS_PER_DAY, RESIDUAL_SMOOTH
 
+try:
+    import _netsentinel_cpp as _cpp
+except ImportError:          # not built; the Python reference is used
+    _cpp = None
+
 KPI_FEATURES = list(KPIS.keys())
 RESIDUAL_COLUMNS = [f"{k}_res" for k in KPI_FEATURES]
 SMOOTHED_COLUMNS = [f"{k}_res_mean{RESIDUAL_SMOOTH}" for k in KPI_FEATURES]
 FEATURE_COLUMNS = KPI_FEATURES + SMOOTHED_COLUMNS
 
 
+def baseline_backend() -> str:
+    if _cpp is not None and os.getenv("NETSENTINEL_FEATURES", "auto").lower() != "python":
+        return "cpp"
+    return "python"
+
+
+def _weekend_flags(cell_df: pd.DataFrame) -> np.ndarray:
+    if "timestamp" in cell_df.columns:
+        return (pd.to_datetime(cell_df["timestamp"]).dt.dayofweek >= 5).to_numpy()
+    return np.zeros(len(cell_df), dtype=bool)
+
+
 def seasonal_baseline(cell_df: pd.DataFrame) -> pd.DataFrame:
+    """Baseline per KPI for one cell, using the C++ version if it is built."""
+    if baseline_backend() == "cpp":
+        values = np.ascontiguousarray(cell_df[KPI_FEATURES].to_numpy(dtype=float))
+        base = _cpp.seasonal_baseline(values, _weekend_flags(cell_df), READINGS_PER_DAY,
+                                      BASELINE_DAYS, FALLBACK_WINDOW)
+        return pd.DataFrame(base, index=cell_df.index, columns=KPI_FEATURES)
+    return seasonal_baseline_python(cell_df)
+
+
+def seasonal_baseline_python(cell_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Baseline per KPI for one cell. Rows must be in time order with no gaps.
+    Reference implementation. Rows must be in time order with no gaps.
 
     Order of preference for each reading:
       1. same 15-min slot (+/- one) on earlier days of the same type
@@ -49,10 +82,7 @@ def seasonal_baseline(cell_df: pd.DataFrame) -> pd.DataFrame:
     """
     values = cell_df[KPI_FEATURES].astype(float)
     n = len(values)
-    if "timestamp" in cell_df.columns:
-        weekend = (pd.to_datetime(cell_df["timestamp"]).dt.dayofweek >= 5).to_numpy()
-    else:
-        weekend = np.zeros(n, dtype=bool)
+    weekend = _weekend_flags(cell_df)
 
     same_type, any_type = [], []
     for day in range(1, BASELINE_DAYS + 1):

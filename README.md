@@ -210,6 +210,44 @@ Some cases worth replaying (cell, reading):
 | Handover storm | CELL_0015 | 902 |
 | Harmless surge, no alarm | CELL_0001 | 1262 |
 
+## C++ component
+
+The baseline calculation in `features.py` also exists as a C++17 library
+(`cpp/`), the part of the feature pipeline that does the most work. It is
+exposed to Python through pybind11, and `features.py` uses it automatically
+when it is built. The Python version stays as the reference.
+
+- `cpp/src/baseline.cpp`: the algorithm, no Python dependency
+- `cpp/tests/test_baseline.cpp`: 12 GoogleTest cases (median, fallback order,
+  weekday/weekend, no look-ahead, missing values, bad input)
+- `tests/test_cpp_parity.py`: the C++ and Python versions must agree to
+  1e-12 on full cells, short histories, missing values and data without
+  timestamps
+
+| | Python (numpy) | C++ |
+|---|---|---|
+| All 100 cells, 14 days | 3.53 s | 0.45 s (7.9x) |
+| One cell, a week of history | 18 ms | 2.6 ms |
+
+Largest difference between the two outputs on the full dataset: 0.
+
+### Building it
+
+On macOS you need the Xcode command line tools (`xcode-select --install`);
+on Linux a C++17 compiler. CMake and pybind11 come from `requirements-dev.txt`.
+
+```bash
+cmake -S cpp -B build -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
+cmake --build build -j
+ctest --test-dir build --output-on-failure     # GoogleTest
+pytest tests/test_cpp_parity.py                 # C++ vs Python
+python -m experiments.bench_baseline            # timing
+```
+
+The build writes `_netsentinel_cpp*.so` to the repository root. Without it,
+everything still works on the Python version and the parity tests are
+skipped. `NETSENTINEL_FEATURES=python` forces the Python version.
+
 ## Tests and CI
 
 `pytest` covers the simulator (ranges, correlations, daily pattern, fault
@@ -238,6 +276,7 @@ evaluation.py        alarms, event-level metrics, baseline detectors
 model_trainer.py     training, scoring, held-out comparison
 llm.py               LLM backends (Ollama, Anthropic API, none)
 llm_eval.py          LLM vs rules evaluation on held-out faults
+cpp/                 C++17 baseline, pybind11 bindings, GoogleTest
 experiments/         feature selection on validation days
 knowledge_base.py    remediation procedures per failure mode
 pipeline.py          LangGraph agent
@@ -259,7 +298,6 @@ tests/               pytest suite
 ## Roadmap
 
 - Run `llm_eval.py` with a real model and publish the numbers
-- C++ scoring component (CMake, GoogleTest, pybind11)
 - Jenkins pipeline alongside GitHub Actions
 
 ## References

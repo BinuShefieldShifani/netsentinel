@@ -8,10 +8,12 @@ code runs locally, in CI (no LLM) and against a remote Ollama host.
 
 import os
 
-# ── LLM (Ollama) ──────────────────────────────────────────────────────────
-OLLAMA_HOST    = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL   = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
-LLM_TIMEOUT_S  = float(os.getenv("NETSENTINEL_LLM_TIMEOUT", "60"))
+# ── LLM ───────────────────────────────────────────────────────────────────
+# Backend is chosen with NETSENTINEL_LLM = ollama (default) | anthropic | none.
+OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
+LLM_TIMEOUT_S   = float(os.getenv("NETSENTINEL_LLM_TIMEOUT", "60"))
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 DATA_DIR     = "data"

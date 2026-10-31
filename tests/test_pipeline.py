@@ -132,6 +132,17 @@ def test_cause_must_be_confirmed_by_a_human_even_at_high_confidence(dataset, fak
     assert plan["escalate_to_human"] is True
 
 
+def test_auto_apply_needs_the_rules_to_agree(dataset, fake_llm):
+    """The LLM is confident and names an auto-applicable fix, but the readings say interference."""
+    p = fake_llm(classifier=json.dumps({"failure_mode": "handover_storm", "confidence": "HIGH"}))
+    out = p.run_analysis(*_first(dataset, "interference"))
+    assert out["failure_mode"] == "handover_storm"
+    assert out["rules_mode"] != "handover_storm"
+    assert out["action_plan"]["apply_immediately"] is False
+    assert out["action_plan"]["rules_agree"] is False
+    assert out["action_plan"]["escalate_to_human"] is True
+
+
 def test_medium_confidence_is_escalated(dataset, fake_llm):
     p = fake_llm(classifier=json.dumps({"failure_mode": "capacity_overload", "confidence": "MEDIUM"}))
     plan = p.run_analysis(*_first(dataset, "capacity_overload"))["action_plan"]

@@ -20,8 +20,11 @@ How the pipeline avoids trusting the LLM blindly:
   - The safety-relevant fields of the action plan (apply_immediately,
     escalate_to_human, actions, parameters) are always set by code.
     The LLM only fills in two free-text explanation fields.
-  - A plan is applied automatically only when confidence is HIGH and the
-    procedure is marked auto-applicable. Everything else goes to a human.
+  - A plan is applied automatically only when three things hold: the
+    confidence is HIGH, the procedure is marked auto-applicable, and the
+    rule-based classifier independently reaches the same failure mode.
+    An LLM can be confidently wrong; the cross-check catches most of that.
+    Everything else goes to a human.
 """
 
 import json
@@ -33,14 +36,8 @@ from typing import Optional, TypedDict
 import numpy as np
 from langgraph.graph import END, START, StateGraph
 
-from config import (
-    ANOMALY_SCENARIOS,
-    KPIS,
-    LLM_TIMEOUT_S,
-    OLLAMA_HOST,
-    OLLAMA_MODEL,
-    ZSCORE_FLAG,
-)
+import llm
+from config import ANOMALY_SCENARIOS, KPIS, ZSCORE_FLAG
 from features import RESIDUAL_COLUMNS, build_features
 from knowledge_base import format_for_llm, retrieve_procedure
 from model_trainer import load_model_and_scaler, score_cell_window, severity_from_score
@@ -67,6 +64,7 @@ class AgentState(TypedDict):
     failure_mode: str
     failure_confidence: str
     classification_source: str      # "llm" or "rules"
+    rules_mode: str                 # what the rule-based classifier says, kept for the cross-check
     root_cause_summary: str
     procedure: dict
     action_plan: dict
@@ -82,20 +80,8 @@ def get_model():
 
 
 def call_llm(prompt: str, system: str = "") -> Optional[str]:
-    """Return the LLM reply, or None if the LLM is unavailable."""
-    try:
-        import ollama
-        client = ollama.Client(host=OLLAMA_HOST, timeout=LLM_TIMEOUT_S)
-        messages = [{"role": "system", "content": system}] if system else []
-        messages.append({"role": "user", "content": prompt})
-        resp = client.chat(
-            model=OLLAMA_MODEL,
-            messages=messages,
-            options={"temperature": 0.1, "num_predict": 500},
-        )
-        return resp["message"]["content"].strip()
-    except Exception:
-        return None
+    """Reply from the configured LLM (see llm.py), or None if there isn't one."""
+    return llm.complete(prompt, system)
 
 
 def parse_json(text: Optional[str]) -> Optional[dict]:
@@ -221,18 +207,20 @@ def validate_diagnosis(diagnosis: Optional[dict]) -> Optional[tuple[str, str, st
     return mode, conf, str(diagnosis.get("summary", ""))[:500]
 
 
-def root_cause_classifier_node(state: AgentState) -> AgentState:
-    log = list(state["reasoning_log"])
-    snapshot, z, flagged = state["kpi_snapshot"], state["kpi_zscores"], state["flagged_kpis"]
+CLASSIFIER_SYSTEM = "You are a 5G RAN engineer. Return only JSON."
 
+
+def classifier_prompt(cell_id: str, score: float, snapshot: dict, z: dict, flagged: list[str]) -> str:
     kpi_context = "\n".join(
         f"  {k}: {snapshot[k]:.3f} (z={z[k]:.2f})" + (" <- FLAGGED" if k in flagged else "")
         for k in KPIS
     )
     modes = "\n".join(f"  {k}: {v}" for k, v in ANOMALY_SCENARIOS.items())
-    prompt = (
-        "Classify the failure mode of this 5G cell from its KPI readings.\n\n"
-        f"Cell: {state['cell_id']} | Anomaly score: {state['anomaly_score']:.4f} | "
+    return (
+        "Classify the failure mode of this 5G cell from its KPI readings.\n"
+        "z is how far each KPI is from this cell's normal value at this time of day, "
+        "in robust standard deviations (negative = lower than normal).\n\n"
+        f"Cell: {cell_id} | Anomaly score: {score:.4f} | "
         f"Flagged KPIs: {', '.join(flagged) or 'none'}\n\n"
         f"KPI READINGS:\n{kpi_context}\n\nPOSSIBLE FAILURE MODES:\n{modes}\n\n"
         "Respond with JSON only:\n"
@@ -240,17 +228,30 @@ def root_cause_classifier_node(state: AgentState) -> AgentState:
         '"summary": "<2 sentence technical explanation>"}'
     )
 
+
+def diagnose(prompt: str) -> tuple[Optional[tuple[str, str, str]], Optional[str]]:
+    """Ask the LLM. Returns (validated diagnosis or None, raw reply)."""
+    raw = call_llm(prompt, system=CLASSIFIER_SYSTEM)
+    return validate_diagnosis(parse_json(raw)), raw
+
+
+def decide(llm_result: Optional[tuple[str, str, str]], z: dict) -> tuple[str, str, str, str]:
+    """Final (mode, confidence, summary, source): the LLM if valid, else the rules at LOW confidence."""
+    if llm_result:
+        mode, confidence, summary = llm_result
+        return mode, confidence, summary, "llm"
+    return rule_based_classify(z), "LOW", "", "rules"
+
+
+def root_cause_classifier_node(state: AgentState) -> AgentState:
+    log = list(state["reasoning_log"])
+    prompt = classifier_prompt(state["cell_id"], state["anomaly_score"], state["kpi_snapshot"],
+                               state["kpi_zscores"], state["flagged_kpis"])
     log.append("[Root Cause Classifier] Asking LLM for failure mode ...")
-    result = validate_diagnosis(parse_json(call_llm(prompt, system="You are a 5G RAN engineer. Return only JSON.")))
-
-    if result:
-        mode, confidence, summary = result
-        source = "llm"
-    else:
-        mode = rule_based_classify(z)
-        confidence, summary, source = "LOW", "", "rules"
+    llm_result, _ = diagnose(prompt)
+    mode, confidence, summary, source = decide(llm_result, state["kpi_zscores"])
+    if source == "rules":
         log.append("[Root Cause Classifier] LLM unavailable or output invalid, using rule-based fallback")
-
     log.append(f"[Root Cause Classifier] Mode: {mode} | Confidence: {confidence} | Source: {source}")
 
     proc = retrieve_procedure(mode)
@@ -264,9 +265,19 @@ def root_cause_classifier_node(state: AgentState) -> AgentState:
     }
     log.append(f"[Root Cause Classifier] Procedure: {procedure['id']}")
 
+    rules_mode = rule_based_classify(state["kpi_zscores"])
+    if source == "llm" and rules_mode != mode:
+        log.append(f"[Root Cause Classifier] Rules disagree ({rules_mode}), so no automatic action")
+
     return {**state, "failure_mode": mode, "failure_confidence": confidence,
-            "classification_source": source, "root_cause_summary": summary,
-            "procedure": procedure, "reasoning_log": log}
+            "classification_source": source, "rules_mode": rules_mode,
+            "root_cause_summary": summary, "procedure": procedure, "reasoning_log": log}
+
+
+def would_auto_apply(mode: str, confidence: str, rules_mode: str) -> bool:
+    """HIGH confidence + auto-applicable procedure + independent agreement from the rules."""
+    proc = retrieve_procedure(mode)
+    return confidence == "HIGH" and bool(proc and proc.auto_applicable) and rules_mode == mode
 
 
 # ── Node 3b: Routine monitor ──────────────────────────────────────────────
@@ -282,7 +293,8 @@ def routine_monitor_node(state: AgentState) -> AgentState:
         "root_cause_summary": "Cell operating within normal parameters.",
         "procedure": {},
         "action_plan": {
-            "type": "MONITORING", "cell_id": state["cell_id"],
+            "type": "MONITORING", "plan_id": f"MON-{state['cell_id']}-{uuid.uuid4().hex[:8]}",
+            "cell_id": state["cell_id"],
             "failure_mode": "none", "confidence": "HIGH", "classification_source": "rules",
             "apply_immediately": False, "escalate_to_human": False,
             "anomaly_score": round(state["anomaly_score"], 4), "severity": "NORMAL",
@@ -298,7 +310,7 @@ def routine_monitor_node(state: AgentState) -> AgentState:
 def build_action_plan(state: AgentState) -> dict:
     """All decision fields come from code, never from the LLM."""
     proc = state["procedure"]
-    apply_now = state["failure_confidence"] == "HIGH" and bool(proc.get("auto_applicable"))
+    apply_now = would_auto_apply(state["failure_mode"], state["failure_confidence"], state["rules_mode"])
     return {
         "plan_id": f"ACT-{state['cell_id']}-{uuid.uuid4().hex[:8]}",
         "cell_id": state["cell_id"],
@@ -306,6 +318,7 @@ def build_action_plan(state: AgentState) -> dict:
         "failure_mode": state["failure_mode"],
         "confidence": state["failure_confidence"],
         "classification_source": state["classification_source"],
+        "rules_agree": state["rules_mode"] == state["failure_mode"],
         "apply_immediately": apply_now,
         "escalate_to_human": not apply_now,
         "anomaly_score": round(state["anomaly_score"], 4),
@@ -336,7 +349,7 @@ def remediation_planner_node(state: AgentState) -> AgentState:
         f"Flagged KPIs: {', '.join(state['flagged_kpis']) or 'none'}\n"
         f"Procedure:\n{format_for_llm(proc_obj)[:400] if proc_obj else 'none'}"
     )
-    text = parse_json(call_llm(prompt, system="You are a 5G RAN engineer. Return only JSON."))
+    text = parse_json(call_llm(prompt, system=CLASSIFIER_SYSTEM))
     if text:
         for field in ("technical_rationale", "expected_outcome"):
             value = text.get(field)
@@ -376,7 +389,7 @@ def run_analysis(cell_id: str, cell_df) -> AgentState:
         "cell_id": cell_id, "cell_df": df,
         "kpi_snapshot": {}, "kpi_zscores": {}, "flagged_kpis": [], "time_window": "",
         "anomaly_score": 0.0, "is_anomalous": False, "severity": "NORMAL",
-        "failure_mode": "", "failure_confidence": "", "classification_source": "",
+        "failure_mode": "", "failure_confidence": "", "classification_source": "", "rules_mode": "",
         "root_cause_summary": "", "procedure": {}, "action_plan": {},
         "reasoning_log": [],
     })

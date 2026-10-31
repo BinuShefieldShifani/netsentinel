@@ -38,12 +38,18 @@ to make decisions about a live cell. Concretely:
    code. The LLM may only fill in `technical_rationale` and
    `expected_outcome`. There is a test where the LLM tries to switch on
    auto-apply and replace the actions; both are ignored.
-3. **Auto-apply needs two conditions.** A plan is applied without a human
-   only if the confidence is HIGH *and* the procedure is marked
-   auto-applicable. Only load balancing (capacity overload) and handover
-   tuning (handover storm) are, since those match SON functions operators
-   commonly automate. Interference, hardware faults and coverage gaps need
-   their cause confirmed by a person first, whatever the LLM says.
+3. **Auto-apply needs three conditions.** A plan is applied without a human
+   only if the confidence is HIGH, the procedure is marked auto-applicable,
+   *and* the rule-based classifier independently names the same failure
+   mode. Only load balancing (capacity overload) and handover tuning
+   (handover storm) are auto-applicable, since those match SON functions
+   operators commonly automate. Interference, hardware faults and coverage
+   gaps need their cause confirmed by a person first, whatever the LLM says.
+
+   The cross-check was added after testing a scripted LLM that always
+   answers "handover storm, HIGH confidence". Without it, that LLM would
+   have triggered 72 wrong automatic fixes on 86 held-out faults. With it,
+   13. Those 13 are cases where the rules make the same mistake.
 4. **It works without the LLM.** With Ollama switched off, the pipeline still
    detects, classifies and escalates. CI runs the whole suite this way.
 
@@ -135,6 +141,30 @@ With the LLM offline, the rule-based fallback names the right failure mode
 for about 84% of severe faults and about a third of subtle ones. Most of
 the subtle misses come back as "unclassified", which goes to a human.
 
+## Measuring the LLM against the rules
+
+`llm_eval.py` takes about 100 labelled faults from the held-out days, gives
+the LLM exactly the prompt the pipeline uses, and gives the rules the same
+numbers. It reports accuracy (overall, severe, subtle, per fault type), how
+often replies are valid, whether the LLM's confidence means anything, how
+often LLM and rules disagree and who is right, latency, and above all how
+many automatic fixes would be applied for the wrong fault.
+
+```bash
+# Anthropic API (no local GPU needed)
+NETSENTINEL_LLM=anthropic ANTHROPIC_API_KEY=sk-ant-... python llm_eval.py --n 100
+
+# or a local / remote Ollama model
+NETSENTINEL_LLM=ollama OLLAMA_MODEL=gpt-oss:20b python llm_eval.py --n 100
+```
+
+Results go to `reports/`. Baseline without any LLM, on 86 held-out faults:
+the rules name the right fault 62% of the time (86% of severe faults, 28%
+of subtle ones).
+
+The real LLM numbers are not in this README yet; they get added once the
+evaluation has been run.
+
 ## Setup
 
 Python 3.11 or newer.
@@ -148,11 +178,12 @@ streamlit run app.py         # dashboard
 pytest                       # 71 tests, no LLM needed
 ```
 
-The LLM is optional. To use one, run Ollama and set:
+The LLM is optional. Pick a backend with `NETSENTINEL_LLM`:
 
 ```bash
-export OLLAMA_HOST=http://localhost:11434
-export OLLAMA_MODEL=gpt-oss:20b     # any chat model you have pulled
+export NETSENTINEL_LLM=ollama        # default; also set OLLAMA_HOST, OLLAMA_MODEL
+export NETSENTINEL_LLM=anthropic     # also set ANTHROPIC_API_KEY, optionally ANTHROPIC_MODEL
+export NETSENTINEL_LLM=none          # rules only
 ```
 
 ## Tests and CI
@@ -181,6 +212,8 @@ data_generator.py    synthetic KPI simulation
 features.py          per-cell time-of-day baseline and deviation features
 evaluation.py        alarms, event-level metrics, baseline detectors
 model_trainer.py     training, scoring, held-out comparison
+llm.py               LLM backends (Ollama, Anthropic API, none)
+llm_eval.py          LLM vs rules evaluation on held-out faults
 experiments/         feature selection on validation days
 knowledge_base.py    remediation procedures per failure mode
 pipeline.py          LangGraph agent
@@ -201,7 +234,7 @@ tests/               pytest suite
 
 ## Roadmap
 
-- Measure LLM classification accuracy against the rule-based baseline
+- Run `llm_eval.py` with a real model and publish the numbers
 - C++ scoring component (CMake, GoogleTest, pybind11)
 - Jenkins pipeline alongside GitHub Actions
 

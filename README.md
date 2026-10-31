@@ -175,7 +175,7 @@ pip install -r requirements-dev.txt
 
 python model_trainer.py      # generates data/, trains models/, prints the comparison
 streamlit run app.py         # dashboard
-pytest                       # 71 tests, no LLM needed
+pytest                       # 83 tests (+14 C++ parity tests when built), no LLM needed
 ```
 
 The LLM is optional. Pick a backend with `NETSENTINEL_LLM`:
@@ -263,8 +263,22 @@ reviewed: every healthy cell was reported CRITICAL (wrong score scale), every
 fault was classified as interference when the LLM was offline, and
 single-reading faults were averaged away by the KPI monitor.
 
-GitHub Actions runs lint, tests and a training run on Python 3.11 and 3.12,
-and uploads the metrics file from each run.
+### CI: GitHub Actions and Jenkins
+
+All checks live in `ci/run_checks.sh` (lint, C++ build with warnings as
+errors, GoogleTest, pytest with JUnit output, training run). Both CI systems
+call that script, so they can't drift apart:
+
+- **GitHub Actions** runs it on Python 3.11 and 3.12, checks that everything
+  still works without the C++ module, and builds the Jenkins agent image
+  (`ci/Dockerfile`) and runs the full pipeline inside it.
+- **Jenkins** (`Jenkinsfile`) runs the same stages in that image, publishes
+  the JUnit results and archives the metrics. It is set up to work with
+  Gerrit's change-based review through the Gerrit Trigger plugin; see
+  `CONTRIBUTING.md`.
+
+The Jenkinsfile itself has not been run on a Jenkins server. Everything it
+calls is run on every push by the agent-image job.
 
 ## Project layout
 
@@ -277,6 +291,8 @@ model_trainer.py     training, scoring, held-out comparison
 llm.py               LLM backends (Ollama, Anthropic API, none)
 llm_eval.py          LLM vs rules evaluation on held-out faults
 cpp/                 C++17 baseline, pybind11 bindings, GoogleTest
+ci/                  shared CI script and the Jenkins agent image
+Jenkinsfile          Jenkins pipeline
 experiments/         feature selection on validation days
 knowledge_base.py    remediation procedures per failure mode
 pipeline.py          LangGraph agent
@@ -298,7 +314,6 @@ tests/               pytest suite
 ## Roadmap
 
 - Run `llm_eval.py` with a real model and publish the numbers
-- Jenkins pipeline alongside GitHub Actions
 
 ## References
 

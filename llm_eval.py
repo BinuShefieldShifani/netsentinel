@@ -48,7 +48,7 @@ import pandas as pd
 import llm
 import pipeline
 import prompts
-from config import ANOMALY_SCENARIOS
+from config import ANOMALY_SCENARIOS, PROMPT_VARIANT
 from data_generator import generate_dataset
 from model_trainer import score_cell_window, severity_from_score, train_mask
 
@@ -326,7 +326,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--n", type=int, default=100, help="number of fault events (spread over 5 modes)")
     ap.add_argument("--split", choices=SPLITS, default="validation")
-    ap.add_argument("--prompt", choices=prompts.VARIANTS, default="basic")
+    ap.add_argument("--prompt", choices=prompts.VARIANTS, default=PROMPT_VARIANT,
+                    help="default: the pipeline's current prompt (NETSENTINEL_PROMPT)")
     ap.add_argument("--shots", type=int, default=2, help="few-shot examples per failure mode")
     ap.add_argument("--max-errors", type=int, default=3, help="stop after this many LLM errors in a row")
     args = ap.parse_args()

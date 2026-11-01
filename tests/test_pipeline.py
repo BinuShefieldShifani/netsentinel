@@ -3,6 +3,7 @@ import json
 import pandas as pd
 import pytest
 
+import pipeline as pipeline_module
 from config import ANOMALY_SCENARIOS
 from pipeline import decide as pipeline_decide
 from pipeline import flag_kpis, parse_json, robust_zscores, rule_based_classify, validate_diagnosis
@@ -117,12 +118,21 @@ def _first(dataset, scenario):
     return dataset.loc[i, "cell_id"], window_ending_at(dataset, i)
 
 
-def test_high_confidence_auto_applicable_fix_is_applied(dataset, fake_llm):
+def test_eligible_fix_is_applied_when_automation_is_switched_on(dataset, fake_llm, monkeypatch):
+    monkeypatch.setattr(pipeline_module, "AUTO_APPLY_ENABLED", True)
     p = fake_llm(classifier=json.dumps({"failure_mode": "handover_storm", "confidence": "HIGH", "summary": "s"}))
     out = p.run_analysis(*_first(dataset, "handover_storm"))
-    assert out["classification_source"] == "llm"
+    assert out["action_plan"]["auto_apply_eligible"] is True
     assert out["action_plan"]["apply_immediately"] is True
     assert out["action_plan"]["escalate_to_human"] is False
+
+
+def test_automation_is_off_by_default_so_eligible_fixes_go_to_a_person(dataset, fake_llm):
+    p = fake_llm(classifier=json.dumps({"failure_mode": "handover_storm", "confidence": "HIGH", "summary": "s"}))
+    plan = p.run_analysis(*_first(dataset, "handover_storm"))["action_plan"]
+    assert plan["auto_apply_eligible"] is True
+    assert plan["apply_immediately"] is False
+    assert plan["escalate_to_human"] is True
 
 
 @pytest.mark.parametrize("mode", ["hardware_fault", "interference", "coverage_gap"])
@@ -133,8 +143,10 @@ def test_cause_must_be_confirmed_by_a_human_even_at_high_confidence(dataset, fak
     assert plan["escalate_to_human"] is True
 
 
-def test_auto_apply_needs_the_rules_to_agree(dataset, fake_llm):
-    """The LLM is confident and names an auto-applicable fix, but the readings say interference."""
+def test_auto_apply_needs_the_rules_to_agree(dataset, fake_llm, monkeypatch):
+    """With the LLM deciding: it is confident and names an auto-applicable fix, but the readings say interference."""
+    monkeypatch.setattr(pipeline_module, "DECISION_POLICY", "llm_first")
+    monkeypatch.setattr(pipeline_module, "AUTO_APPLY_ENABLED", True)
     p = fake_llm(classifier=json.dumps({"failure_mode": "handover_storm", "confidence": "HIGH"}))
     out = p.run_analysis(*_first(dataset, "interference"))
     assert out["failure_mode"] == "handover_storm"
@@ -142,6 +154,15 @@ def test_auto_apply_needs_the_rules_to_agree(dataset, fake_llm):
     assert out["action_plan"]["apply_immediately"] is False
     assert out["action_plan"]["rules_agree"] is False
     assert out["action_plan"]["escalate_to_human"] is True
+
+
+def test_rules_first_overrides_a_confident_wrong_llm(dataset, fake_llm):
+    """Default policy: the rules name the fault, the LLM's wrong answer is ignored."""
+    p = fake_llm(classifier=json.dumps({"failure_mode": "handover_storm", "confidence": "HIGH"}))
+    out = p.run_analysis(*_first(dataset, "interference"))
+    assert out["failure_mode"] == out["rules_mode"] != "handover_storm"
+    assert out["failure_confidence"] == "LOW"
+    assert out["action_plan"]["auto_apply_eligible"] is False
 
 
 def test_medium_confidence_is_escalated(dataset, fake_llm):

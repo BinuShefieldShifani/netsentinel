@@ -16,15 +16,18 @@ pipeline.py - NetSentinel LangGraph agent pipeline
 How the pipeline avoids trusting the LLM blindly:
   - The LLM's failure mode and confidence are checked against a fixed set
     of allowed values. Anything else (bad JSON, unknown mode, LLM offline)
-    falls back to a rule-based classifier with LOW confidence.
+    is treated as no answer.
+  - By default the rules decide (policy rules_first). The LLM is only used
+    when the rules can't name the fault, and its confidence only counts
+    when it agrees with the rules.
   - The safety-relevant fields of the action plan (apply_immediately,
     escalate_to_human, actions, parameters) are always set by code.
     The LLM only fills in two free-text explanation fields.
-  - A plan is applied automatically only when three things hold: the
-    confidence is HIGH, the procedure is marked auto-applicable, and the
-    rule-based classifier independently reaches the same failure mode.
-    An LLM can be confidently wrong; the cross-check catches most of that.
-    Everything else goes to a human.
+  - A fix is eligible for automatic application only when the confidence is
+    HIGH, the procedure is auto-applicable, the rules independently agree,
+    and the anomaly model rates the reading CRITICAL. Automatic application
+    itself is switched off by default (AUTO_APPLY_ENABLED); eligible fixes
+    still go to a person.
 """
 
 import json
@@ -40,6 +43,7 @@ import llm
 import prompts
 from config import (
     ANOMALY_SCENARIOS,
+    AUTO_APPLY_ENABLED,
     AUTO_APPLY_REQUIRES_CRITICAL,
     DECISION_POLICY,
     KPIS,
@@ -338,8 +342,9 @@ def routine_monitor_node(state: AgentState) -> AgentState:
 def build_action_plan(state: AgentState) -> dict:
     """All decision fields come from code, never from the LLM."""
     proc = state["procedure"]
-    apply_now = would_auto_apply(state["failure_mode"], state["failure_confidence"], state["rules_mode"],
-                                 state["severity"])
+    eligible = would_auto_apply(state["failure_mode"], state["failure_confidence"], state["rules_mode"],
+                                state["severity"])
+    apply_now = eligible and AUTO_APPLY_ENABLED
     return {
         "plan_id": f"ACT-{state['cell_id']}-{uuid.uuid4().hex[:8]}",
         "cell_id": state["cell_id"],
@@ -348,6 +353,7 @@ def build_action_plan(state: AgentState) -> dict:
         "confidence": state["failure_confidence"],
         "classification_source": state["classification_source"],
         "rules_agree": state["rules_mode"] == state["failure_mode"],
+        "auto_apply_eligible": eligible,
         "apply_immediately": apply_now,
         "escalate_to_human": not apply_now,
         "anomaly_score": round(state["anomaly_score"], 4),

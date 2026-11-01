@@ -20,6 +20,7 @@ from plotly.subplots import make_subplots
 from config import (
     ANOMALY_SCORE_CRITICAL,
     ANOMALY_SCORE_WARNING,
+    AUTO_APPLY_ENABLED,
     AUTO_APPLY_REQUIRES_CRITICAL,
     DECISION_POLICY,
     KPIS,
@@ -148,7 +149,8 @@ with st.sidebar:
     st.markdown("### Agent")
     st.code(describe_backend(), language=None)
     st.caption(f"Prompt: {PROMPT_VARIANT} · policy: {DECISION_POLICY} · "
-               f"auto-apply needs CRITICAL: {'yes' if AUTO_APPLY_REQUIRES_CRITICAL else 'no'}")
+               f"automatic fixes: {'on' if AUTO_APPLY_ENABLED else 'off'}"
+               f"{' (CRITICAL only)' if AUTO_APPLY_REQUIRES_CRITICAL else ''}")
     run_btn = st.button("▶ Run agent on current reading", type="primary", width="stretch")
 
     st.markdown("### Model results (held-out days)")
@@ -337,8 +339,13 @@ with tab4:
                 st.markdown("**Auto-apply:** not needed, no fault")
                 st.markdown("**Escalate:** no")
             else:
-                st.markdown("**Auto-apply:** "
-                            + ("✅ yes" if plan.get("apply_immediately") else "❌ no, needs human approval"))
+                if plan.get("apply_immediately"):
+                    auto_text = "✅ yes"
+                elif plan.get("auto_apply_eligible"):
+                    auto_text = "eligible, but automatic changes are switched off: needs approval"
+                else:
+                    auto_text = "❌ no, needs human approval"
+                st.markdown("**Auto-apply:** " + auto_text)
                 st.markdown("**Escalate:** " + ("🔴 yes" if plan.get("escalate_to_human") else "no"))
 
         st.markdown("---")

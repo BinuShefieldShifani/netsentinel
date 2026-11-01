@@ -17,7 +17,7 @@ Isolation Forest · LangGraph · Ollama · Streamlit · pytest · GitHub Actions
 [anomaly_scorer]     Isolation Forest score of the latest reading
       |
   (router)
-      |-- anomalous -> [root_cause_classifier]   LLM, validated, with rule-based fallback
+      |-- anomalous -> [root_cause_classifier]   rules first, LLM when they can't decide
       |                         |
       |                [remediation_planner]     plan built in code, LLM writes text only
       |
@@ -26,32 +26,35 @@ Isolation Forest · LangGraph · Ollama · Streamlit · pytest · GitHub Actions
 
 ## How the pipeline avoids trusting the LLM blindly
 
-The LLM is useful for explaining a fault in plain language. It is not trusted
-to make decisions about a live cell. Concretely:
+The LLM is useful for the faults the rules can't name and for explaining a
+fault in plain language. It is not trusted to make decisions about a live
+cell on its own. Concretely:
 
 1. **Its output is validated.** The failure mode must be one of five known
    values and the confidence must be HIGH, MEDIUM or LOW. Bad JSON, an
-   invented failure mode, or an unreachable LLM all lead to the same place: a
-   rule-based classifier takes over and the confidence is set to LOW.
-2. **It can't touch the decision fields.** `apply_immediately`,
+   invented failure mode, or an unreachable LLM all count as no answer.
+2. **The rules decide first.** The rule-based classifier names the fault
+   whenever it can. The LLM is only used when the rules answer
+   "unclassified", and its confidence only counts when it agrees with the
+   rules. This was chosen by measurement, see below.
+3. **It can't touch the decision fields.** `apply_immediately`,
    `escalate_to_human`, the actions and the parameters are always set by
    code. The LLM may only fill in `technical_rationale` and
    `expected_outcome`. There is a test where the LLM tries to switch on
    auto-apply and replace the actions; both are ignored.
-3. **Auto-apply needs three conditions.** A plan is applied without a human
-   only if the confidence is HIGH, the procedure is marked auto-applicable,
-   *and* the rule-based classifier independently names the same failure
-   mode. Only load balancing (capacity overload) and handover tuning
-   (handover storm) are auto-applicable, since those match SON functions
-   operators commonly automate. Interference, hardware faults and coverage
-   gaps need their cause confirmed by a person first, whatever the LLM says.
-
-   The cross-check was added after testing a scripted LLM that always
-   answers "handover storm, HIGH confidence". Without it, that LLM would
-   have triggered 72 wrong automatic fixes on 86 held-out faults. With it,
-   13. Those 13 are cases where the rules make the same mistake.
-4. **It works without the LLM.** With Ollama switched off, the pipeline still
-   detects, classifies and escalates. CI runs the whole suite this way.
+4. **A fix is only eligible for automatic application if four things hold:**
+   the confidence is HIGH, the procedure is auto-applicable (only load
+   balancing and handover tuning, the SON functions operators commonly
+   automate), the rules independently name the same fault, and the anomaly
+   model rates the reading CRITICAL.
+5. **Automatic application is switched off anyway.** Even with all four
+   checks, 2 of the 10 eligible fixes on the held-out days were for the
+   wrong fault. That's too many for unattended changes to a live network,
+   so `NETSENTINEL_AUTO_APPLY` defaults to off: the plan says the fix is
+   eligible, and a person approves it. This was decided after seeing the
+   held-out result. It doesn't change any reported number.
+6. **It works without the LLM.** With no LLM the rules still classify and
+   everything is escalated. CI runs the whole suite this way.
 
 See `tests/test_pipeline.py` for the tests behind each point.
 
@@ -153,7 +156,8 @@ be applied for the wrong fault.
 
 ### First result: the LLM made things worse
 
-Qwen2.5 7B through Ollama on a Kaggle T4, original prompt, 86 held-out faults:
+Qwen2.5 7B through Ollama on a Kaggle T4, original prompt, LLM deciding
+first, 86 held-out faults (`reports/first_run_heldout_basic.md`):
 
 | | LLM | Rules | Pipeline (LLM first) |
 |---|---|---|---|
@@ -162,55 +166,76 @@ Qwen2.5 7B through Ollama on a Kaggle T4, original prompt, 86 held-out faults:
 | Subtle (36) | 46% | 28% | 44% |
 
 - The LLM said HIGH confidence on 81 of 85 valid replies and was right 56%
-  of the time, so its confidence is not a usable safety signal.
+  of the time, so its confidence was no use as a safety signal.
 - The pipeline would have applied 30 automatic fixes, 13 for the wrong
-  fault. The rules cross-check cut this from 22, but it can't catch
+  fault. The rules cross-check had cut this from 22, but it can't catch
   mistakes both make: subtle capacity overloads and coverage gaps look like
   handover storms to both.
-- The LLM is better than the rules on subtle faults, where the rules often
-  give up and answer "unclassified".
+- The LLM was better than the rules on subtle faults, where the rules often
+  give up.
 
-This comparison favours the rules: they were written by someone who knew
+That comparison favoured the rules: they were written by someone who knew
 how the simulator creates each fault, while the LLM only got a one-line
 description of each mode.
 
 ### Giving the LLM a fair chance
 
-The next round tests whether a better setup changes the picture:
+Six setups were compared on **validation days 8 to 10** (54 faults each,
+`reports/validation_summary.md`): Qwen2.5 7B and 14B, each with three
+prompts (`basic`; `signatures`, which adds what each fault does to the KPIs,
+the same knowledge the rules use; `fewshot`, which adds 10 solved examples
+from days 1 to 7), two decision policies (`llm_first`, `rules_first`) and
+two auto-apply rules (rules agree; rules agree + CRITICAL reading).
 
-- **Prompts** (`--prompt`): `basic` (the prompt above), `signatures` (adds
-  what each fault does to the KPIs, the same knowledge the rules use),
-  `fewshot` (signatures plus 10 solved examples from days 1 to 7)
-- **Models:** Qwen2.5 7B and 14B
-- **Decision policies:** `llm_first` (the LLM decides, rules as fallback) and
-  `rules_first` (the rules decide, the LLM only when they say
-  "unclassified"); the LLM's confidence is kept only when it agrees with
-  the rules
-- **Auto-apply:** the current three conditions, and the same plus "the
-  reading must be CRITICAL"
+The selection rule was written down before the runs: fewest wrong automatic
+fixes, then best pipeline accuracy, then the simplest setup (rules over LLM,
+smaller model, shorter prompt). It picked **7B, signatures prompt,
+rules_first, CRITICAL required**. Along the way:
 
-The held-out run above was used to decide to run these experiments, so the
-choice between them is made on **validation days 8 to 10** (54 faults). The
-held-out days are run once more at the end with the chosen setup. With 54
-faults, differences under about 10 points are noise.
+- `rules_first` beat `llm_first` in all six setups.
+- The 14B model was no better than 7B.
+- Few-shot examples made the 7B model more confident without making it more
+  correct: the most wrong automatic fixes of any setup.
 
-**How the winner is chosen, decided before seeing the results:** first, the
-fewest automatic fixes for the wrong fault; then the highest pipeline
-accuracy; then the simplest setup (rules over LLM, smaller model, shorter
-prompt).
+### Final result on the held-out days
 
-Results: to be added after the validation runs.
+The chosen setup, run once on the 86 held-out faults
+(`reports/llm_eval_ollama-qwen2-5-7b-heldout-signatures.md`):
+
+| | Rules alone | Chosen setup (rules first, LLM when they can't decide) | First run (LLM first, basic prompt) |
+|---|---|---|---|
+| All faults | 62% | **71%** | 57% |
+| Severe (50) | 86% | **88%** | 66% |
+| Subtle (36) | 28% | **47%** | 44% |
+| Automatic fixes / wrong | n/a | **10 / 2** | 30 / 13 |
+
+- The gain over the rules alone is +9 points here and was +8 on validation:
+  two separate sets of days, same direction.
+- It comes from where expected. Severe faults barely move; subtle ones go
+  from 28% to 47%. When the rules give up, the LLM is right half the time.
+- With the signatures prompt the LLM uses MEDIUM as well as HIGH, and HIGH
+  answers are right 69% of the time. Better, but still not a safety signal
+  on its own.
+- 2 wrong fixes out of 10 is still too many for unattended changes, which is
+  why automatic application is off by default (see above). The most common
+  remaining mistake, made by both LLM and rules, is calling a coverage gap a
+  handover storm. Improving that is the next step, tuned on validation days.
+
+In short: on this task a 7B LLM is not a better classifier than physics
+rules, but it is a useful second opinion for the faults the rules can't
+name, as long as the rules stay in charge.
+
+### Running it
 
 ```bash
 python llm_eval.py --prompt signatures                     # validation days (default)
 python -m experiments.compare_llm_reports --split validation
-python llm_eval.py --split heldout --prompt <chosen>       # once, at the end
+python llm_eval.py --split heldout --prompt signatures     # final numbers only
 ```
 
-The pipeline's settings are environment variables, and the defaults are the
-original behaviour until a variant wins on validation:
-`NETSENTINEL_PROMPT` (basic | signatures | fewshot), `NETSENTINEL_POLICY`
-(llm_first | rules_first), `NETSENTINEL_AUTO_CRITICAL` (0 | 1).
+Settings (defaults are the chosen setup): `NETSENTINEL_PROMPT` (basic |
+signatures | fewshot), `NETSENTINEL_POLICY` (llm_first | rules_first),
+`NETSENTINEL_AUTO_CRITICAL` (1 | 0), `NETSENTINEL_AUTO_APPLY` (0 | 1).
 
 ## Setup
 
@@ -228,7 +253,7 @@ pytest                       # 83 tests (+14 C++ parity tests when built), no LL
 The LLM is optional. Pick a backend with `NETSENTINEL_LLM`:
 
 ```bash
-export NETSENTINEL_LLM=ollama        # default; also set OLLAMA_HOST, OLLAMA_MODEL
+export NETSENTINEL_LLM=ollama        # default; OLLAMA_MODEL defaults to qwen2.5:7b
 export NETSENTINEL_LLM=anthropic     # also set ANTHROPIC_API_KEY, optionally ANTHROPIC_MODEL
 export NETSENTINEL_LLM=none          # rules only
 ```
@@ -361,7 +386,8 @@ tests/               pytest suite
 
 ## Roadmap
 
-- Finish the fair-chance LLM experiments and set the pipeline defaults from them
+- Fix the coverage gap vs handover storm confusion (tune on validation days)
+- More validation faults: three days give only 54, so small differences are noise
 
 ## References
 

@@ -11,15 +11,20 @@ import os
 # ── LLM ───────────────────────────────────────────────────────────────────
 # Backend is chosen with NETSENTINEL_LLM = ollama (default) | anthropic | none.
 OLLAMA_HOST     = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")      # the model evaluated in the README
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-haiku-5-5")
 LLM_TIMEOUT_S   = float(os.getenv("NETSENTINEL_LLM_TIMEOUT", "60"))
 
-# How the LLM is used. Defaults are the original behaviour; they only change
-# after a variant has won on the validation days (llm_eval.py --split validation).
-PROMPT_VARIANT  = os.getenv("NETSENTINEL_PROMPT", "basic")        # basic | signatures | fewshot
-DECISION_POLICY = os.getenv("NETSENTINEL_POLICY", "llm_first")    # llm_first | rules_first
-AUTO_APPLY_REQUIRES_CRITICAL = os.getenv("NETSENTINEL_AUTO_CRITICAL", "0") == "1"
+# How the LLM is used. Chosen on validation days 8-10 (see README and
+# reports/validation_summary.md), confirmed once on the held-out days.
+PROMPT_VARIANT  = os.getenv("NETSENTINEL_PROMPT", "signatures")   # basic | signatures | fewshot
+DECISION_POLICY = os.getenv("NETSENTINEL_POLICY", "rules_first")  # llm_first | rules_first
+AUTO_APPLY_REQUIRES_CRITICAL = os.getenv("NETSENTINEL_AUTO_CRITICAL", "1") == "1"
+
+# Master switch for automatic fixes. Off by default: on the held-out days 2 of
+# the 10 fixes that passed every check were for the wrong fault. With it off,
+# the plan still says whether a fix would be eligible, and a person approves it.
+AUTO_APPLY_ENABLED = os.getenv("NETSENTINEL_AUTO_APPLY", "0") == "1"
 
 # ── Paths ─────────────────────────────────────────────────────────────────
 DATA_DIR     = "data"
